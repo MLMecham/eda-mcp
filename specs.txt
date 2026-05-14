@@ -1,0 +1,194 @@
+Build a Python MCP server package called `eda-mcp` with the following specifications:
+
+## Package Structure
+- Use `src` layout with `pyproject.toml`
+- Package name: `eda-mcp`, importable as `eda_mcp`
+- CLI entrypoint: `eda-mcp` that starts the MCP server
+- Include a `Dockerfile` for Cloud Run deployment
+- Include a `README.md` with usage instructions for local (uvx) and cloud (Docker) deployment
+- Modules: `server.py`, `stats.py`, `plots.py`, `report.py`, `reader.py`
+
+## Dependencies
+- `mcp[cli]` for the MCP server
+- `polars` for data loading and summarization
+- `matplotlib` and `seaborn` for diagnostic plots
+- `scipy` for QQ plots, skewness, kurtosis, and normality tests
+- `jinja2` for markdown report templating
+- `openpyxl` for Excel support via Polars
+
+## reader.py — Data Loading
+Auto-detect file format from extension and route to the correct Polars reader:
+- `.csv` → `pl.read_csv()`
+- `.parquet` → `pl.read_parquet()`
+- `.xlsx`, `.xls` → `pl.read_excel()`
+- `.json` → `pl.read_json()`
+- `.ndjson` → `pl.read_ndjson()`
+- `.avro` → `pl.read_avro()`
+
+Raise a descriptive error string for unsupported formats. All tools call this reader so file format is always handled consistently.
+
+## stats.py — Summary Statistics
+Implement a `classify_column(series: pl.Series) -> str` function that returns one of:
+- `"continuous"` — float, or int with more than 20 unique values
+- `"discrete"` — int with 20 or fewer unique values
+- `"categorical"` — string/enum with cardinality ratio below 5%
+- `"binary"` — boolean, or any column with exactly 2 unique values
+- `"temporal"` — Date, Datetime, or Duration dtype
+- `"high_cardinality"` — string with cardinality ratio above 5% (likely an ID or free text column)
+
+Implement `get_summary(series: pl.Series) -> dict` that returns appropriate statistics based on classification:
+
+For ALL types:
+- dtype (as string)
+- classification result
+- row_count
+- missing_count and missing_pct
+- unique_count and cardinality_ratio
+
+For continuous and discrete additionally:
+- min, Q1, median, Q3, max
+- mean and std
+- skewness with plain english label: "strongly left skewed" (<-1), "moderately left skewed" (-1 to -0.5), "approximately normal" (-0.5 to 0.5), "moderately right skewed" (0.5 to 1), "strongly right skewed" (>1)
+- kurtosis with plain english label: "platykurtic/light tailed" (<-1), "approximately normal" (-1 to 1), "leptokurtic/heavy tailed" (>1)
+- outlier_count using IQR method (values below Q1 - 1.5*IQR or above Q3 + 1.5*IQR)
+- outlier_pct
+- zero_count and zero_pct
+- infinite_count (values that are inf or -inf)
+- normality_test: run scipy.stats.normaltest, return p-value and a plain english result: "likely normal (p>0.05)" or "likely not normal (p<=0.05)"
+
+For categorical and binary additionally:
+- mode (most frequent value)
+- top_10_value_counts as a list of {value, count, pct} dicts
+- class_balance for binary: ratio of majority to minority class, with flag "imbalanced" if ratio > 3:1
+
+For temporal additionally:
+- min_date and max_date
+- date_range_days
+- gap_count: number of missing expected intervals (assume daily if gaps exist)
+- most_common_year and most_common_month
+
+For high_cardinality:
+- flag it as "possible ID or free text column, statistical summary not meaningful"
+- still return missing_count, unique_count, cardinality_ratio
+- sample of 5 example values
+
+## plots.py — Diagnostic Plots
+Use Polars for data access. Convert to numpy via `.drop_nulls().to_numpy()` only at the point of passing data to seaborn or scipy. Do not use pandas anywhere.
+
+Implement `generate_plots(series: pl.Series, column_name: str, classification: str, output_dir: str) -> str` that saves a PNG and returns its file path.
+
+Plot selection by classification:
+
+continuous:
+- 2x2 panel: histogram with KDE overlay, boxplot with outliers highlighted, QQ plot with reference line, ECDF
+- Use seaborn for histogram and boxplot, scipy.stats.probplot for QQ, numpy for ECDF
+
+discrete:
+- 2x1 panel: bar chart of value counts, boxplot
+
+categorical:
+- 1x1: horizontal bar chart of top 20 value counts with percentage labels
+
+binary:
+- 1x1: bar chart showing class balance with proportion labels, highlight imbalance if ratio > 3:1 in red
+
+temporal:
+- 2x1 panel: line plot of value counts over time, bar chart of counts by month
+
+high_cardinality:
+- skip plot generation, return None
+
+All plots:
+- Use a clean minimal style (seaborn whitegrid)
+- Title each panel with the column name and classification
+- Save as PNG at 150 DPI to output_dir/{column_name}_diagnostics.png
+- Return the saved file path as a string
+
+## report.py — Markdown Report Generation
+Implement `generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) -> str` that:
+
+1. Runs `classify_column` and `get_summary` for every column
+2. Runs `generate_plots` for every column
+3. Produces a markdown file with the following structure:
+
+
+EDA Report: {filename}
+Generated: {timestamp}
+Dataset Overview
+
+Source: {file_path}
+Rows: {n}
+Columns: {n}
+Total missing values: {n} ({pct}%)
+Memory usage: {mb} MB
+
+Data Quality Flags
+(list any columns with >20% missing, imbalanced binary columns,
+high cardinality columns, columns with infinite values,
+columns with >10% outliers)
+Variable Summaries
+{column_name} [{classification}]
+{summary statistics as a markdown table}
+{embedded plot image if available}
+{plain english interpretation based on skewness, kurtosis, normality test, outliers}
+
+
+The plain english interpretation should be 2-3 sentences synthesizing the stats, for example:
+"age is approximately normally distributed (p=0.21) with a slight right skew. 
+3.2% of values are outliers by IQR method. No missing values detected."
+
+Save the report as `{filename}_eda_report.md` in output_dir. Return the output path.
+
+## server.py — MCP Tools
+Expose the following tools using @mcp.tool() decorators. Write detailed docstrings on every tool as these are what the LLM reads to decide when and how to use them.
+
+Tools:
+
+1. `load_dataset(file_path: str) -> dict`
+   Loads a dataset and returns an overview: column names, dtypes, row count, 
+   column classifications, missing value counts. Use this first to understand 
+   what is in a dataset before running summaries or plots.
+
+2. `get_column_summary(file_path: str, column: str) -> dict`
+   Returns full summary statistics for a single column including five number 
+   summary, skewness, kurtosis, outlier count, missing values, and normality 
+   test. Classification is auto-detected.
+
+3. `get_all_summaries(file_path: str) -> list[dict]`
+   Returns summary statistics for every column in the dataset. Use this for 
+   a complete statistical overview of all variables at once.
+
+4. `get_diagnostic_plot(file_path: str, column: str, output_dir: str) -> str`
+   Generates and saves diagnostic plots appropriate for the column type. 
+   Returns the file path of the saved PNG. Plot type is auto-selected based 
+   on column classification.
+
+5. `generate_report(file_path: str, output_dir: str) -> str`
+   Generates a full EDA markdown report for the entire dataset including 
+   summary statistics, diagnostic plots, data quality flags, and plain 
+   english interpretations for every column. Returns the path to the 
+   saved markdown file. This is the main tool to call for a complete 
+   dataset analysis.
+
+## Transport
+- Default to `stdio` for local use
+- Read `MCP_TRANSPORT` environment variable to switch to `sse` for cloud deployment
+- Read `PORT` environment variable for SSE port, default to 8080 for Cloud Run compatibility
+
+## Dockerfile
+- Base image: `python:3.12-slim`
+- Install the package via pip
+- Set ENV MCP_TRANSPORT=sse
+- Expose port 8080
+- Run as non-root user for security
+
+## Error Handling
+- All tools must catch exceptions and return descriptive error strings rather than raising
+- Never let an unhandled exception crash the server
+- If a plot fails for one column, log the error and continue with the report
+
+## pyproject.toml
+- Minimum Python version: 3.11
+- Include all dependencies listed above
+- Define the `eda-mcp` CLI entrypoint pointing to `eda_mcp.server:main`
+- Include project metadata: description, author placeholder, MIT license

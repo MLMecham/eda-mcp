@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eda-mcp"
+version = "0.1.0"
+description = "MCP server for exploratory data analysis"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Author" }]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]",
+    "polars",
+    "matplotlib",
+    "seaborn",
+    "scipy",
+    "jinja2",
+    "openpyxl",
+]
+
+[project.scripts]
+eda-mcp = "eda_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eda_mcp"]
