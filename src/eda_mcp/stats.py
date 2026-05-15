@@ -53,7 +53,7 @@ def classify_column(series: pl.Series) -> str:
         return "binary"
     if dtype in (pl.Date, pl.Duration) or str(dtype).startswith("Datetime"):
         return "temporal"
-    if n_unique == 2:
+    if series.drop_nulls().n_unique() == 2:
         return "binary"
     if _is_probable_id(series):
         return "high_cardinality"
@@ -64,7 +64,7 @@ def classify_column(series: pl.Series) -> str:
             return "discrete"
         return "continuous" if n_unique > 20 else "discrete"
     if dtype in _STRING_TYPES or str(dtype) == "Utf8":
-        return "categorical" if cardinality_ratio < 0.05 else "high_cardinality"
+        return "categorical" if (cardinality_ratio < 0.05 or n_unique <= 10) else "high_cardinality"
     return "high_cardinality"
 
 

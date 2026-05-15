@@ -4,8 +4,16 @@ from pathlib import Path
 import polars as pl
 from jinja2 import Template
 
-from .plots import generate_plots
-from .stats import classify_column, get_summary
+from eda_mcp.correlations import (
+    compute_correlations,
+    numeric_columns,
+    plot_heatmap,
+    plot_scatter,
+    strong_pairs,
+)
+from eda_mcp.plots import generate_plots
+from eda_mcp.stats import classify_column, get_summary
+from eda_mcp.utils import warn
 
 _TEMPLATE = Template("""\
 # EDA Report: {{ filename }}
@@ -19,6 +27,7 @@ Generated: {{ timestamp }}
 | Rows | {{ rows }} |
 | Columns | {{ columns }} |
 | Total missing values | {{ total_missing }} ({{ total_missing_pct }}%) |
+| Duplicate rows | {{ duplicate_rows }} ({{ duplicate_pct }}%) |
 | Memory usage | {{ memory_mb }} MB |
 
 ## Data Quality Flags
@@ -54,6 +63,35 @@ No data quality issues detected.
 
 ---
 {% endfor %}
+
+{% if corr %}
+## Correlation Analysis
+
+Numeric columns: {{ corr.columns | join(', ') }}
+
+{% if corr.heatmap %}
+![Spearman Correlation Heatmap]({{ corr.heatmap }})
+
+{% endif %}
+{% if corr.strong_pairs %}
+### Strong Correlations (|ρ| ≥ {{ corr.threshold }})
+
+| Column A | Column B | Spearman ρ | Pearson r | Flag |
+|---|---|---|---|---|
+{% for pair in corr.strong_pairs %}
+| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.spearman }} | {{ pair.pearson }} | {{ pair.flag or '—' }} |
+{% endfor %}
+
+{% for pair in corr.strong_pairs %}
+{% if pair.scatter_path %}
+![{{ pair.column_a }} vs {{ pair.column_b }}]({{ pair.scatter_path }})
+
+{% endif %}
+{% endfor %}
+{% else %}
+No correlations found above threshold {{ corr.threshold }}.
+{% endif %}
+{% endif %}
 """)
 
 
@@ -67,6 +105,8 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
     total_missing = sum(df[c].null_count() for c in df.columns)
     total_cells = rows * columns
     total_missing_pct = round(total_missing / total_cells * 100, 2) if total_cells > 0 else 0.0
+    duplicate_rows = int(df.is_duplicated().sum())
+    duplicate_pct = round(duplicate_rows / rows * 100, 2) if rows > 0 else 0.0
 
     try:
         memory_mb = round(df.estimated_size("mb"), 2)
@@ -81,7 +121,6 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             summaries[col] = {"classification": "unknown", "error": str(e)}
 
     flags = _collect_flags(summaries)
-
     images_dir = Path(output_dir) / f"{filename}_images"
 
     column_reports = []
@@ -105,6 +144,8 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             "interpretation": _interpret(col, summary),
         })
 
+    corr = _build_correlation_section(df, filename, images_dir)
+
     out_path = str(Path(output_dir) / f"{filename}_eda_report.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(_TEMPLATE.render(
@@ -115,12 +156,52 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             columns=columns,
             total_missing=total_missing,
             total_missing_pct=total_missing_pct,
+            duplicate_rows=duplicate_rows,
+            duplicate_pct=duplicate_pct,
             memory_mb=memory_mb,
             flags=flags,
             column_reports=column_reports,
+            corr=corr,
         ))
 
     return out_path
+
+
+def _build_correlation_section(
+    df: pl.DataFrame, filename: str, images_dir: Path
+) -> dict | None:
+    try:
+        cols = numeric_columns(df)
+        if len(cols) < 2:
+            return None
+
+        threshold = 0.5
+        pearson, spearman = compute_correlations(df, cols)
+        pairs = strong_pairs(pearson, spearman, cols, threshold)
+
+        heatmap_abs = plot_heatmap(spearman, cols, str(images_dir))
+        heatmap_rel = f"{filename}_images/{Path(heatmap_abs).name}"
+
+        for pair in pairs:
+            try:
+                scatter_abs = plot_scatter(
+                    df, pair["column_a"], pair["column_b"],
+                    pair["spearman"], str(images_dir)
+                )
+                pair["scatter_path"] = f"{filename}_images/{Path(scatter_abs).name}"
+            except Exception as e:
+                warn(f"Scatter plot failed for {pair['column_a']} vs {pair['column_b']}: {e}")
+                pair["scatter_path"] = None
+
+        return {
+            "columns": cols,
+            "strong_pairs": pairs,
+            "heatmap": heatmap_rel,
+            "threshold": threshold,
+        }
+    except Exception as e:
+        warn(f"Correlation analysis failed: {e}")
+        return None
 
 
 def _collect_flags(summaries: dict) -> list[str]:

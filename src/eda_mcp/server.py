@@ -1,5 +1,14 @@
+from pathlib import Path
+
 from mcp.server.fastmcp import FastMCP
 
+from eda_mcp.correlations import (
+    compute_correlations,
+    numeric_columns,
+    plot_heatmap,
+    plot_scatter,
+    strong_pairs,
+)
 from eda_mcp.plots import generate_plots
 from eda_mcp.reader import load_file
 from eda_mcp.report import generate_markdown_report
@@ -7,6 +16,12 @@ from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.utils import handle_errors
 
 mcp = FastMCP("eda-mcp")
+
+
+def _resolve_output_dir(file_path: str, output_dir: str | None) -> str:
+    if output_dir:
+        return output_dir
+    return str(Path(file_path.strip()).parent / "output")
 
 
 @mcp.tool()
@@ -29,10 +44,13 @@ def load_dataset(file_path: str, table: str | None = None) -> dict:
     """
     df = load_file(file_path, table)
     n = df.shape[0]
+    duplicate_rows = int(df.is_duplicated().sum())
     return {
         "file_path": file_path,
         "rows": n,
         "columns": df.shape[1],
+        "duplicate_rows": duplicate_rows,
+        "duplicate_pct": round(duplicate_rows / n * 100, 2) if n > 0 else 0.0,
         "column_names": df.columns,
         "dtypes": {col: str(df[col].dtype) for col in df.columns},
         "classifications": {col: classify_column(df[col]) for col in df.columns},
@@ -66,7 +84,9 @@ def get_column_summary(file_path: str, column: str, table: str | None = None) ->
     """
     df = load_file(file_path, table)
     if column not in df.columns:
-        return {"error": f"Column '{column}' not found. Available columns: {df.columns}"}
+        return {
+            "error": f"Column '{column}' not found. Available columns: {df.columns}"
+        }
     return get_summary(df[column])
 
 
@@ -117,17 +137,75 @@ def get_diagnostic_plot(
     """
     df = load_file(file_path, table)
     if column not in df.columns:
-        return {"error": f"Column '{column}' not found. Available columns: {df.columns}"}
+        return {
+            "error": f"Column '{column}' not found. Available columns: {df.columns}"
+        }
     classification = classify_column(df[column])
     if classification == "high_cardinality":
-        return {"error": f"No plot generated for '{column}': high cardinality column (likely ID or free text)."}
+        return {
+            "error": f"No plot generated for '{column}': high cardinality column (likely ID or free text)."
+        }
     path = generate_plots(df[column], column, classification, output_dir)
     return {"path": path} if path else {"error": f"No plot generated for '{column}'."}
 
 
 @mcp.tool()
 @handle_errors
-def generate_report(file_path: str, output_dir: str, table: str | None = None) -> dict:
+def get_correlations(
+    file_path: str,
+    output_dir: str | None = None,
+    threshold: float = 0.5,
+    table: str | None = None,
+) -> dict:
+    """
+    Compute pairwise correlations between all numeric columns in the dataset
+    and generate a Spearman correlation heatmap. Scatter plots are generated
+    for column pairs with a Spearman correlation above the threshold.
+
+    Returns both Pearson and Spearman correlation matrices, the strongest pairs
+    above the threshold (sorted by absolute Spearman correlation, max 10),
+    highly correlated flags for pairs with |ρ| >= 0.9, and file paths for all
+    generated plots.
+
+    Only continuous and discrete columns are included — categorical, binary,
+    temporal, and high_cardinality columns are excluded automatically.
+
+    threshold controls which pairs get scatter plots (default 0.5). Set higher
+    e.g. 0.7 for only strong correlations, lower e.g. 0.3 to cast a wider net.
+    Scatter plots are capped at 10 pairs regardless of threshold.
+    """
+    df = load_file(file_path, table)
+    cols = numeric_columns(df)
+
+    if len(cols) < 2:
+        return {"error": "Need at least 2 numeric columns to compute correlations."}
+
+    out = _resolve_output_dir(file_path, output_dir)
+    pearson, spearman = compute_correlations(df, cols)
+    pairs = strong_pairs(pearson, spearman, cols, threshold)
+
+    heatmap_path = plot_heatmap(spearman, cols, out)
+
+    scatter_paths = []
+    for pair in pairs:
+        path = plot_scatter(
+            df, pair["column_a"], pair["column_b"], pair["spearman"], out
+        )
+        scatter_paths.append(path)
+
+    return {
+        "numeric_columns": cols,
+        "pearson": pearson,
+        "spearman": spearman,
+        "strong_pairs": pairs,
+        "heatmap": heatmap_path,
+        "scatter_plots": scatter_paths,
+    }
+
+
+@mcp.tool()
+@handle_errors
+def generate_report(file_path: str, output_dir: str | None = None, table: str | None = None) -> dict:
     """
     Generate a complete EDA markdown report for the entire dataset. This is the
     main tool to call for a thorough, end-to-end analysis. The report includes:
@@ -147,7 +225,7 @@ def generate_report(file_path: str, output_dir: str, table: str | None = None) -
     get_diagnostic_plot instead of running the full report.
     """
     df = load_file(file_path, table)
-    path = generate_markdown_report(df, file_path, output_dir)
+    path = generate_markdown_report(df, file_path, _resolve_output_dir(file_path, output_dir))
     return {"path": path}
 
 
