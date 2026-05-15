@@ -18,6 +18,9 @@ from eda_mcp.utils import handle_errors
 
 mcp = FastMCP("eda-mcp")
 
+_COMPACT_KEYS = {"row_count", "missing_pct", "mean", "median", "std", "min", "Q1", "Q3", "max", "skewness", "outlier_pct"}
+_NUMERIC_DIFF_KEYS = ["mean", "median", "std", "min", "max", "outlier_pct", "missing_pct"]
+
 
 def _dataset_overview(df: pl.DataFrame) -> dict:
     n = df.shape[0]
@@ -123,6 +126,7 @@ def get_column_summary(
     column: str,
     table: str | None = None,
     classification: str | None = None,
+    full_summary: bool = True,
 ) -> dict:
     """
     Return full summary statistics for a single column. The column type is
@@ -149,13 +153,17 @@ def get_column_summary(
     mismatches (e.g. "continuous" on a string column), and "binary" on a column
     with more than 2 unique values are rejected with a warning and fall back to
     auto-detection.
+    full_summary: if True (default), returns all statistics. If False, returns
+    the compact subset used by get_column_summary_by_group — useful for
+    consistency when comparing a single column against grouped results.
     """
     df = load_file(file_path, table)
     if column not in df.columns:
         return {
             "error": f"Column '{column}' not found. Available columns: {df.columns}"
         }
-    return get_summary(df[column], classification)
+    summary = get_summary(df[column], classification)
+    return summary if full_summary else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
 
 
 @mcp.tool()
@@ -318,6 +326,178 @@ def generate_report(
         df, file_path, _resolve_output_dir(file_path, output_dir)
     )
     return {"path": path}
+
+
+@mcp.tool()
+@handle_errors
+def compare_distributions(
+    source_a: str,
+    source_b: str,
+    label_a: str | None = None,
+    label_b: str | None = None,
+) -> dict:
+    """
+    Compare the distributions of two data slices column by column and return
+    a statistical diff. Each source should resolve to one flat slice of data —
+    use WHERE to define the group, not GROUP BY.
+
+    Both source_a and source_b accept a file path or a SQL query, same as
+    query_dataset:
+
+      # Two file paths
+      compare_distributions("sales_2023.parquet", "sales_2024.parquet")
+
+      # Two slices from the same file — one condition per source
+      compare_distributions(
+          "SELECT * FROM 'diamonds.parquet' WHERE cut='Ideal'",
+          "SELECT * FROM 'diamonds.parquet' WHERE cut='Fair'",
+          label_a="Ideal", label_b="Fair"
+      )
+
+      # Subgroups — AND as many conditions as needed, still one flat slice per source
+      compare_distributions(
+          "SELECT * FROM 'diamonds.parquet' WHERE cut='Ideal' AND color='D'",
+          "SELECT * FROM 'diamonds.parquet' WHERE cut='Fair' AND color='J'",
+          label_a="Ideal-D", label_b="Fair-J"
+      )
+
+      # Two result paths from query_dataset
+      compare_distributions(result_path_a, result_path_b, label_a="2023", label_b="2024")
+
+    Returns:
+    - shape: row and column count for each source
+    - only_in_a / only_in_b: columns that appear in one source but not the other
+    - per_column_diffs: for each shared column, the delta between the two sources —
+      numeric deltas (mean_delta, median_delta, std_delta, outlier_pct_delta,
+      missing_pct_delta), classification changes, and mode changes for categoricals
+
+    label_a / label_b: optional human-readable names used in the response
+    (e.g. "Ideal", "Fair", "2023", "2024"). Defaults to "a" and "b".
+    """
+    label_a = label_a or "a"
+    label_b = label_b or "b"
+
+    df_a = load_query(source_a)
+    df_b = load_query(source_b)
+
+    summaries_a = {col: get_summary(df_a[col]) for col in df_a.columns}
+    summaries_b = {col: get_summary(df_b[col]) for col in df_b.columns}
+
+    cols_a = set(df_a.columns)
+    cols_b = set(df_b.columns)
+    shared = cols_a & cols_b
+
+    per_column_diffs = {}
+    for col in shared:
+        s_a = summaries_a[col]
+        s_b = summaries_b[col]
+        diff = {
+            f"classification_{label_a}": s_a.get("classification"),
+            f"classification_{label_b}": s_b.get("classification"),
+            "classification_changed": s_a.get("classification") != s_b.get("classification"),
+        }
+        for key in _NUMERIC_DIFF_KEYS:
+            v_a = s_a.get(key)
+            v_b = s_b.get(key)
+            if v_a is not None and v_b is not None:
+                try:
+                    diff[f"{key}_{label_a}"] = v_a
+                    diff[f"{key}_{label_b}"] = v_b
+                    diff[f"{key}_delta"] = round(float(v_b) - float(v_a), 4)
+                except (TypeError, ValueError):
+                    pass
+        if s_a.get("classification") == "categorical" or s_b.get("classification") == "categorical":
+            diff[f"mode_{label_a}"] = s_a.get("mode")
+            diff[f"mode_{label_b}"] = s_b.get("mode")
+            diff["mode_changed"] = s_a.get("mode") != s_b.get("mode")
+            diff[f"unique_count_{label_a}"] = s_a.get("unique_count")
+            diff[f"unique_count_{label_b}"] = s_b.get("unique_count")
+
+        per_column_diffs[col] = diff
+
+    return {
+        "shape": {
+            label_a: {"rows": df_a.shape[0], "columns": df_a.shape[1]},
+            label_b: {"rows": df_b.shape[0], "columns": df_b.shape[1]},
+        },
+        f"only_in_{label_a}": sorted(cols_a - cols_b),
+        f"only_in_{label_b}": sorted(cols_b - cols_a),
+        "per_column_diffs": per_column_diffs,
+    }
+
+
+@mcp.tool()
+@handle_errors
+def get_column_summary_by_group(
+    file_path: str,
+    column: str,
+    group_by: str | list[str],
+    table: str | None = None,
+    full_summary: bool = False,
+) -> dict:
+    """
+    Return summary statistics for a column broken down by each unique combination
+    of one or more group columns. Equivalent to calling get_column_summary once
+    per group, but in a single call.
+
+    Use this after load_dataset to investigate how a column's distribution
+    varies across categories — e.g. how BST varies by bond_tier, or how
+    revenue varies by region and year together.
+
+    Pass a single column name or a list of column names to group_by. Multiple
+    group columns produce a cartesian breakdown — use load_dataset first to
+    understand cardinality before grouping by high-cardinality columns, as this
+    can produce a very large number of groups.
+
+    For comparing exactly two groups with quantified deltas, use
+    compare_distributions instead — it explicitly shows by how much each statistic
+    changed. get_column_summary_by_group is better when you have many groups
+    and want to see all of them at once.
+
+    Returns a dict keyed by group value (or tuple of group values for multiple
+    group columns), each containing the full summary stats for that group —
+    same structure as get_column_summary. Also includes a top-level "groups"
+    key listing all group combinations found, and "group_counts" showing the
+    row count per group.
+
+    column: the column to summarize within each group.
+    group_by: column name or list of column names to group by.
+    full_summary: if False (default), returns a compact summary per group —
+    count, missing_pct, mean, median, std, min, Q1, Q3, max, skewness,
+    outlier_pct. If True, returns the complete get_summary output including
+    kurtosis, normality test, zero count, etc. Only use full_summary=True
+    when you have very few groups (3 or fewer) and need the detailed stats.
+    """
+    df = load_file(file_path, table)
+
+    if column not in df.columns:
+        return {"error": f"Column '{column}' not found. Available columns: {df.columns}"}
+
+    group_cols = [group_by] if isinstance(group_by, str) else group_by
+    missing = [c for c in group_cols if c not in df.columns]
+    if missing:
+        return {"error": f"Group column(s) not found: {missing}. Available columns: {df.columns}"}
+
+    results = {}
+    group_counts = {}
+
+    for group_values, group_df in df.group_by(group_cols, maintain_order=True):
+        key = group_values[0] if len(group_cols) == 1 else tuple(group_values)
+        key = str(key)
+        group_counts[key] = len(group_df)
+        try:
+            summary = get_summary(group_df[column])
+            results[key] = summary if full_summary else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
+        except Exception as e:
+            results[key] = {"error": str(e)}
+
+    return {
+        "column": column,
+        "group_by": group_by,
+        "groups": list(results.keys()),
+        "group_counts": group_counts,
+        "summaries": results,
+    }
 
 
 def main():
