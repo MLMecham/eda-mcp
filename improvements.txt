@@ -1,0 +1,46 @@
+## Improvements to Implement
+
+### 1. Warnings System (reader.py)
+- _coerce_types() should return (df, warnings: list[str]) instead of silently swallowing failures
+- Callers should surface warnings alongside results so agents and users know what changed
+- Example: "Failed datetime coercion for column 'created_at', kept as String"
+
+### 2. Safer Automatic Type Coercion (reader.py)
+- Current order (Date -> Datetime -> Int -> Float) is dangerous
+- Integer-like IDs e.g. "10234" can silently become dates
+- Fix: only attempt Date/Datetime coercion if the string looks date-like
+  (contains "-", "/", or matches a loose date pattern)
+- Or: move Date/Datetime after Int/Float in the coercion order
+
+### 3. Better High-Cardinality and Identifier Detection (stats.py)
+- 5% cardinality ratio alone is too weak
+- Add checks:
+  - all-unique values -> likely identifier, force high_cardinality regardless of dtype
+  - UUID pattern (hex + dashes, 36 chars) -> high_cardinality
+  - column name contains "id", "uuid", "key", "hash" -> flag as probable identifier
+
+### 4. Smarter Integer Classification (stats.py)
+- "n_unique > 20 = continuous" is too simplistic
+- Add checks:
+  - all-unique integers -> probable identifier, not continuous
+  - values all fall in 1900-2100 range -> flag as possible year/temporal
+  - column name contains "year", "yr" -> flag as possible temporal
+
+### 7. Narrow the Broad try/except Blocks (reader.py, stats.py)
+- Silent broad excepts make debugging hard and hide real bugs
+- _coerce_types: catch specific exceptions (InvalidOperationError, ComputeError)
+  and log them as warnings rather than swallowing everything
+- _numeric_stats, _temporal_stats: let unexpected exceptions bubble up rather
+  than returning empty dicts silently
+
+### 10. Dataset-Level Quality and Correlation Analysis (server.py, stats.py)
+- Add duplicate row count to load_dataset response
+- Add a simple quality score (0-100) to load_dataset based on:
+    - missing value rate
+    - duplicate rows
+    - high-cardinality column count
+    - columns with >10% outliers
+- Add new MCP tool: get_correlations(file_path)
+    - Pearson and Spearman for all numeric column pairs
+    - Return strongest positive and negative pairs
+    - Flag potential multicollinearity (|r| > 0.9)

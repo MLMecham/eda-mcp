@@ -82,15 +82,17 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
 
     flags = _collect_flags(summaries)
 
+    images_dir = Path(output_dir) / f"{filename}_images"
+
     column_reports = []
     for col in df.columns:
         summary = summaries[col]
         classification = summary.get("classification", "unknown")
 
         try:
-            plot_path = generate_plots(df[col], col, classification, output_dir)
+            plot_path = generate_plots(df[col], col, classification, str(images_dir))
             if plot_path:
-                plot_path = Path(plot_path).name
+                plot_path = f"{filename}_images/{Path(plot_path).name}"
         except Exception:
             plot_path = None
 

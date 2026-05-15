@@ -17,8 +17,11 @@ dependencies = [
     "seaborn",
     "scipy",
     "jinja2",
-    "openpyxl",
+    "fastexcel",
 ]
+
+[dependency-groups]
+dev = ["xlsxwriter", "openpyxl"]
 
 [project.scripts]
 eda-mcp = "eda_mcp.server:main"

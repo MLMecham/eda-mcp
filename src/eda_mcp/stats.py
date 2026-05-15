@@ -1,5 +1,9 @@
+import re
+
 from scipy import stats as scipy_stats
 import polars as pl
+
+from eda_mcp.utils import warn
 
 _INTEGER_TYPES = (
     pl.Int8, pl.Int16, pl.Int32, pl.Int64,
@@ -7,6 +11,36 @@ _INTEGER_TYPES = (
 )
 _FLOAT_TYPES = (pl.Float32, pl.Float64)
 _STRING_TYPES = (pl.String, pl.Categorical)
+
+_ID_NAME_RE = re.compile(r'(?:^|_)(?:id|uuid|guid|key|hash)(?:_|$)', re.IGNORECASE)
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+
+def _is_probable_id(series: pl.Series) -> bool:
+    n_total = len(series)
+    n_unique = series.n_unique()
+    # Name strongly suggests an identifier regardless of dtype
+    if _ID_NAME_RE.search(series.name):
+        return True
+    # All-unique integers are likely row IDs or keys, but not floats
+    # (unique floats are just continuous measurements)
+    if n_unique == n_total and n_total > 1 and series.dtype in _INTEGER_TYPES:
+        return True
+    # UUID pattern in string values
+    if series.dtype in _STRING_TYPES:
+        sample = series.drop_nulls().head(5).to_list()
+        if len(sample) >= 3 and sum(bool(_UUID_RE.match(str(v))) for v in sample) >= 3:
+            return True
+    return False
+
+
+def _is_year_like(series: pl.Series) -> bool:
+    clean = series.drop_nulls()
+    if len(clean) == 0:
+        return False
+    min_val = clean.min()
+    max_val = clean.max()
+    return isinstance(min_val, int) and isinstance(max_val, int) and 1900 <= min_val and max_val <= 2100
 
 
 def classify_column(series: pl.Series) -> str:
@@ -21,9 +55,13 @@ def classify_column(series: pl.Series) -> str:
         return "temporal"
     if n_unique == 2:
         return "binary"
+    if _is_probable_id(series):
+        return "high_cardinality"
     if dtype in _FLOAT_TYPES:
         return "continuous"
     if dtype in _INTEGER_TYPES:
+        if _is_year_like(series):
+            return "discrete"
         return "continuous" if n_unique > 20 else "discrete"
     if dtype in _STRING_TYPES or str(dtype) == "Utf8":
         return "categorical" if cardinality_ratio < 0.05 else "high_cardinality"
@@ -66,14 +104,19 @@ def _numeric_stats(series: pl.Series) -> dict:
     infinite_count = int(series.is_infinite().sum()) if is_float else 0
     zero_count = int(clean.filter(clean == 0).len())
 
+    normality: dict
     arr = clean.to_numpy()
     if len(arr) >= 8:
-        _, p = scipy_stats.normaltest(arr)
-        p = float(p)
-        normality = {
-            "p_value": round(p, 4),
-            "result": "likely normal (p>0.05)" if p > 0.05 else "likely not normal (p<=0.05)",
-        }
+        try:
+            _, p = scipy_stats.normaltest(arr)
+            p = float(p)
+            normality = {
+                "p_value": round(p, 4),
+                "result": "likely normal (p>0.05)" if p > 0.05 else "likely not normal (p<=0.05)",
+            }
+        except Exception as e:
+            warn(f"Normality test failed for '{series.name}': {e}")
+            normality = {"p_value": None, "result": "normality test failed"}
     else:
         normality = {"p_value": None, "result": "insufficient data for normality test"}
 
@@ -136,7 +179,8 @@ def _temporal_stats(series: pl.Series) -> dict:
     try:
         delta = max_date - min_date
         date_range_days = delta.days if hasattr(delta, "days") else None
-    except Exception:
+    except Exception as e:
+        warn(f"Could not compute date range for '{series.name}': {e}")
         date_range_days = None
 
     try:
@@ -144,17 +188,20 @@ def _temporal_stats(series: pl.Series) -> dict:
         gap_count = int(diffs.dt.total_days().filter(
             diffs.dt.total_days() > 1
         ).len())
-    except Exception:
+    except Exception as e:
+        warn(f"Could not compute gap count for '{series.name}': {e}")
         gap_count = None
 
     try:
         most_common_year = int(series.dt.year().drop_nulls().mode()[0])
-    except Exception:
+    except Exception as e:
+        warn(f"Could not compute most common year for '{series.name}': {e}")
         most_common_year = None
 
     try:
         most_common_month = int(series.dt.month().drop_nulls().mode()[0])
-    except Exception:
+    except Exception as e:
+        warn(f"Could not compute most common month for '{series.name}': {e}")
         most_common_month = None
 
     return {
