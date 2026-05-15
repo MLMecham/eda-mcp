@@ -28,7 +28,8 @@ Generated: {{ timestamp }}
 | Columns | {{ columns }} |
 | Total missing values | {{ total_missing }} ({{ total_missing_pct }}%) |
 | Duplicate rows | {{ duplicate_rows }} ({{ duplicate_pct }}%) |
-| Memory usage | {{ memory_mb }} MB |
+{% if extra_rows > 0 %}| Extra rows (removable by dedup) | {{ extra_rows }} ({{ extra_rows_pct }}%) |
+{% endif %}| Memory usage | {{ memory_mb }} MB |
 
 ## Data Quality Flags
 
@@ -108,6 +109,8 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
     total_missing_pct = round(total_missing / total_cells * 100, 2) if total_cells > 0 else 0.0
     duplicate_rows = int(df.is_duplicated().sum())
     duplicate_pct = round(duplicate_rows / rows * 100, 2) if rows > 0 else 0.0
+    extra_rows = rows - len(df.unique())
+    extra_rows_pct = round(extra_rows / rows * 100, 2) if rows > 0 else 0.0
 
     try:
         memory_mb = round(df.estimated_size("mb"), 2)
@@ -123,6 +126,7 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
 
     flags = _collect_flags(summaries)
     images_dir = Path(output_dir) / f"{filename}_images"
+    corr_dir = Path(output_dir) / f"{filename}_correlations"
 
     column_reports = []
     for col in df.columns:
@@ -156,7 +160,7 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             "interpretation": _interpret(col, summary),
         })
 
-    corr = _build_correlation_section(df, filename, images_dir)
+    corr = _build_correlation_section(df, filename, corr_dir)
 
     out_path = str(Path(output_dir) / f"{filename}_eda_report.md")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -170,6 +174,8 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             total_missing_pct=total_missing_pct,
             duplicate_rows=duplicate_rows,
             duplicate_pct=duplicate_pct,
+            extra_rows=extra_rows,
+            extra_rows_pct=extra_rows_pct,
             memory_mb=memory_mb,
             flags=flags,
             column_reports=column_reports,
@@ -180,7 +186,7 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
 
 
 def _build_correlation_section(
-    df: pl.DataFrame, filename: str, images_dir: Path
+    df: pl.DataFrame, filename: str, corr_dir: Path
 ) -> dict | None:
     try:
         cols = numeric_columns(df)
@@ -191,16 +197,16 @@ def _build_correlation_section(
         pearson, spearman = compute_correlations(df, cols)
         pairs = strong_pairs(pearson, spearman, cols, threshold)
 
-        heatmap_abs = plot_heatmap(spearman, cols, str(images_dir))
-        heatmap_rel = f"{filename}_images/{Path(heatmap_abs).name}"
+        heatmap_abs = plot_heatmap(spearman, cols, str(corr_dir))
+        heatmap_rel = f"{filename}_correlations/{Path(heatmap_abs).name}"
 
         for pair in pairs:
             try:
                 scatter_abs = plot_scatter(
                     df, pair["column_a"], pair["column_b"],
-                    pair["spearman"], str(images_dir)
+                    pair["spearman"], str(corr_dir)
                 )
-                pair["scatter_path"] = f"{filename}_images/{Path(scatter_abs).name}"
+                pair["scatter_path"] = f"{filename}_correlations/{Path(scatter_abs).name}"
             except Exception as e:
                 warn(f"Scatter plot failed for {pair['column_a']} vs {pair['column_b']}: {e}")
                 pair["scatter_path"] = None

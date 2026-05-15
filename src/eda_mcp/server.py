@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import polars as pl
 from mcp.server.fastmcp import FastMCP
 
 from eda_mcp.correlations import (
@@ -16,6 +17,28 @@ from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.utils import handle_errors
 
 mcp = FastMCP("eda-mcp")
+
+
+def _dataset_overview(df: pl.DataFrame) -> dict:
+    n = df.shape[0]
+    duplicate_rows = int(df.is_duplicated().sum())
+    extra_rows = n - len(df.unique())
+    return {
+        "rows": n,
+        "columns": df.shape[1],
+        "duplicate_rows": duplicate_rows,
+        "duplicate_pct": round(duplicate_rows / n * 100, 2) if n > 0 else 0.0,
+        "extra_rows": extra_rows,
+        "extra_rows_pct": round(extra_rows / n * 100, 2) if n > 0 else 0.0,
+        "column_names": df.columns,
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "classifications": {col: classify_column(df[col]) for col in df.columns},
+        "missing_counts": {col: df[col].null_count() for col in df.columns},
+        "missing_pct": {
+            col: round(df[col].null_count() / n * 100, 2) if n > 0 else 0.0
+            for col in df.columns
+        },
+    }
 
 
 def _resolve_output_dir(file_path: str, output_dir: str | None) -> str:
@@ -35,7 +58,9 @@ def load_dataset(file_path: str, table: str | None = None) -> dict:
 
     Returns: column names, dtypes, row count, per-column classifications
     (continuous, discrete, categorical, binary, temporal, high_cardinality),
-    missing value counts and percentages per column.
+    missing value counts and percentages per column. Also returns duplicate_rows
+    (total rows that have at least one duplicate) and extra_rows (rows that would
+    be removed by deduplication — the actionable count).
 
     Supports CSV, Parquet, Excel (.xlsx/.xls), JSON, NDJSON, Avro, SQLite
     (.db/.sqlite), and DuckDB (.duckdb). For multi-table databases, pass the
@@ -43,23 +68,7 @@ def load_dataset(file_path: str, table: str | None = None) -> dict:
     it is loaded automatically.
     """
     df = load_file(file_path, table)
-    n = df.shape[0]
-    duplicate_rows = int(df.is_duplicated().sum())
-    return {
-        "file_path": file_path,
-        "rows": n,
-        "columns": df.shape[1],
-        "duplicate_rows": duplicate_rows,
-        "duplicate_pct": round(duplicate_rows / n * 100, 2) if n > 0 else 0.0,
-        "column_names": df.columns,
-        "dtypes": {col: str(df[col].dtype) for col in df.columns},
-        "classifications": {col: classify_column(df[col]) for col in df.columns},
-        "missing_counts": {col: df[col].null_count() for col in df.columns},
-        "missing_pct": {
-            col: round(df[col].null_count() / n * 100, 2) if n > 0 else 0.0
-            for col in df.columns
-        },
-    }
+    return {"file_path": file_path, **_dataset_overview(df)}
 
 
 @mcp.tool()
@@ -98,30 +107,13 @@ def query_dataset(
 
     df = load_query(query, db_path)
 
-    n = df.shape[0]
-    if n == 0:
+    if df.shape[0] == 0:
         return {"error": "Query returned 0 rows — check join conditions, filters, or key compatibility."}
 
     if output_path is None:
         output_path = os.path.join(tempfile.gettempdir(), "eda_query_result.parquet")
     df.write_parquet(output_path)
-    duplicate_rows = int(df.is_duplicated().sum())
-    return {
-        "result_path": output_path,
-        "query": query,
-        "rows": n,
-        "columns": df.shape[1],
-        "duplicate_rows": duplicate_rows,
-        "duplicate_pct": round(duplicate_rows / n * 100, 2) if n > 0 else 0.0,
-        "column_names": df.columns,
-        "dtypes": {col: str(df[col].dtype) for col in df.columns},
-        "classifications": {col: classify_column(df[col]) for col in df.columns},
-        "missing_counts": {col: df[col].null_count() for col in df.columns},
-        "missing_pct": {
-            col: round(df[col].null_count() / n * 100, 2) if n > 0 else 0.0
-            for col in df.columns
-        },
-    }
+    return {"result_path": output_path, "query": query, **_dataset_overview(df)}
 
 
 @mcp.tool()
@@ -192,7 +184,7 @@ def get_all_summaries(file_path: str, table: str | None = None) -> dict:
 @mcp.tool()
 @handle_errors
 def get_diagnostic_plot(
-    file_path: str, column: str, output_dir: str, table: str | None = None
+    file_path: str, column: str, output_dir: str, table: str | None = None, classification: str | None = None
 ) -> dict:
     """
     Generate and save a diagnostic plot for a single column as a PNG file.
@@ -210,13 +202,21 @@ def get_diagnostic_plot(
     Saves the PNG to output_dir/{column}_diagnostics.png and returns the file
     path. Use output_dir to control where plots land — the same folder as the
     dataset or a dedicated output directory both work well.
+
+    classification: optional override for the auto-detected column type. Same
+    validation rules as get_column_summary — invalid overrides fall back to
+    auto-detection with a warning.
     """
     df = load_file(file_path, table)
     if column not in df.columns:
         return {
             "error": f"Column '{column}' not found. Available columns: {df.columns}"
         }
-    classification = classify_column(df[column])
+    if classification is not None:
+        from eda_mcp.stats import _validate_classification_override
+        classification = _validate_classification_override(df[column], classification)
+    if classification is None:
+        classification = classify_column(df[column])
     if classification == "high_cardinality":
         return {
             "error": f"No plot generated for '{column}': high cardinality column (likely ID or free text)."
@@ -232,23 +232,25 @@ def get_correlations(
     output_dir: str | None = None,
     threshold: float = 0.5,
     table: str | None = None,
+    plots: bool = False,
 ) -> dict:
     """
-    Compute pairwise correlations between all numeric columns in the dataset
-    and generate a Spearman correlation heatmap. Scatter plots are generated
-    for column pairs with a Spearman correlation above the threshold.
+    Compute pairwise correlations between all numeric columns in the dataset.
 
     Returns both Pearson and Spearman correlation matrices, the strongest pairs
     above the threshold (sorted by absolute Spearman correlation, max 10),
-    highly correlated flags for pairs with |ρ| >= 0.9, and file paths for all
-    generated plots.
+    and highly correlated flags for pairs with |ρ| >= 0.9.
 
     Only continuous and discrete columns are included — categorical, binary,
     temporal, and high_cardinality columns are excluded automatically.
 
-    threshold controls which pairs get scatter plots (default 0.5). Set higher
-    e.g. 0.7 for only strong correlations, lower e.g. 0.3 to cast a wider net.
-    Scatter plots are capped at 10 pairs regardless of threshold.
+    threshold controls which pairs are flagged as strong (default 0.5). Set
+    higher e.g. 0.7 for only strong correlations, lower e.g. 0.3 to cast a
+    wider net.
+
+    plots: set to True to generate a Spearman heatmap and scatter plots for
+    strong pairs. Plots are saved to output_dir/correlations/. Defaults to
+    False — omit when you only need the numbers.
     """
     df = load_file(file_path, table)
     cols = numeric_columns(df)
@@ -256,10 +258,19 @@ def get_correlations(
     if len(cols) < 2:
         return {"error": "Need at least 2 numeric columns to compute correlations."}
 
-    out = _resolve_output_dir(file_path, output_dir)
     pearson, spearman = compute_correlations(df, cols)
     pairs = strong_pairs(pearson, spearman, cols, threshold)
 
+    if not plots:
+        return {
+            "numeric_columns": cols,
+            "pearson": pearson,
+            "spearman": spearman,
+            "strong_pairs": pairs,
+        }
+
+    stem = Path(file_path.strip()).stem
+    out = str(Path(_resolve_output_dir(file_path, output_dir)) / f"{stem}_correlations")
     heatmap_path = plot_heatmap(spearman, cols, out)
 
     scatter_paths = []
