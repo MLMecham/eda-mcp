@@ -5,7 +5,7 @@ import polars as pl
 
 from eda_mcp.utils import warn
 
-_SUPPORTED = {".csv", ".parquet", ".xlsx", ".xls", ".json", ".ndjson", ".avro", ".db", ".sqlite"}
+_SUPPORTED = {".csv", ".parquet", ".xlsx", ".xls", ".json", ".ndjson", ".avro", ".db", ".sqlite", ".duckdb"}
 _STRING_DTYPES = (pl.String, pl.Categorical, pl.Utf8)
 
 
@@ -27,6 +27,8 @@ def load_file(file_path: str, table: str | None = None) -> pl.DataFrame:
         df = pl.read_avro(path)
     elif ext in (".db", ".sqlite"):
         df = _load_sqlite(str(path), table)
+    elif ext == ".duckdb":
+        df = _load_duckdb(str(path), table)
     else:
         raise ValueError(
             f"Unsupported file format '{ext}'. "
@@ -80,6 +82,51 @@ def _coerce_types(df: pl.DataFrame) -> pl.DataFrame:
 def _looks_date_like(series: pl.Series) -> bool:
     sample = series.drop_nulls().head(20).to_list()
     return any(isinstance(v, str) and ("-" in v or "/" in v) for v in sample)
+
+
+def _load_duckdb(file_path: str, table: str | None) -> pl.DataFrame:
+    import duckdb
+
+    conn = duckdb.connect(file_path, read_only=True)
+    tables = [row[0] for row in conn.execute("SHOW TABLES").fetchall()]
+
+    if not tables:
+        raise ValueError(f"No tables found in '{file_path}'.")
+
+    if table is None:
+        if len(tables) == 1:
+            table = tables[0]
+        else:
+            raise ValueError(
+                f"'{file_path}' has multiple tables: {tables}. "
+                f"Specify one with the 'table' parameter."
+            )
+    elif table not in tables:
+        raise ValueError(
+            f"Table '{table}' not found in '{file_path}'. "
+            f"Available tables: {tables}"
+        )
+
+    df = conn.execute(f'SELECT * FROM "{table}"').pl()
+    conn.close()
+    return df
+
+
+def load_query(query: str, db_path: str | None = None) -> pl.DataFrame:
+    import duckdb
+
+    if " " not in query.strip():
+        query = f"SELECT * FROM '{query}'"
+
+    conn = duckdb.connect(db_path or ":memory:")
+    try:
+        conn.install_extension("httpfs")
+        conn.load_extension("httpfs")
+    except Exception:
+        pass  # offline or extension unavailable — local queries still work
+    df = conn.execute(query).pl()
+    conn.close()
+    return _coerce_types(df)
 
 
 def _load_sqlite(file_path: str, table: str | None) -> pl.DataFrame:

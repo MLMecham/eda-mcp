@@ -15,6 +15,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import duckdb
 import polars as pl
 
 ROOT = Path(__file__).parent.parent
@@ -30,7 +31,8 @@ def write_formats(df: pl.DataFrame, name: str) -> None:
     df.write_json(OUT_DIR / f"{name}.json")
     df.write_ndjson(OUT_DIR / f"{name}.ndjson")
     _write_sqlite(df, name, OUT_DIR / f"{name}.db")
-    print(f"  wrote {name} in 6 formats")
+    _write_duckdb(df, name, OUT_DIR / f"{name}.duckdb")
+    print(f"  wrote {name} in 7 formats")
 
 
 def _write_sqlite(df: pl.DataFrame, table: str, path: Path) -> None:
@@ -54,6 +56,43 @@ def _write_sqlite(df: pl.DataFrame, table: str, path: Path) -> None:
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute(f'CREATE TABLE "{table}" ({col_defs})')
         conn.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', (coerce(r) for r in df.rows()))
+
+
+def _write_duckdb(df: pl.DataFrame, table: str, path: Path) -> None:
+    path.unlink(missing_ok=True)
+    conn = duckdb.connect(str(path))
+    conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
+    conn.close()
+
+
+def make_multi_table_duckdb(n: int = 300) -> None:
+    """Two-table DuckDB for testing query_dataset joins."""
+    random.seed(99)
+    player_ids = [f"P{i:04d}" for i in range(n)]
+
+    players = pl.DataFrame({
+        "player_id": player_ids,
+        "name": [f"Player {i}" for i in range(n)],
+        "position": [random.choice(["OF", "IF", "P", "C"]) for _ in range(n)],
+        "birth_year": [random.randint(1970, 2000) for _ in range(n)],
+    })
+
+    stats = pl.DataFrame({
+        "player_id": [random.choice(player_ids) for _ in range(n * 3)],
+        "season": [random.randint(2010, 2023) for _ in range(n * 3)],
+        "games": [random.randint(1, 162) for _ in range(n * 3)],
+        "hits": [random.randint(0, 200) for _ in range(n * 3)],
+        "home_runs": [random.randint(0, 50) for _ in range(n * 3)],
+        "avg": [round(random.uniform(0.150, 0.350), 3) for _ in range(n * 3)],
+    })
+
+    path = OUT_DIR / "multi_table.duckdb"
+    path.unlink(missing_ok=True)
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE players AS SELECT * FROM players")
+    conn.execute("CREATE TABLE stats AS SELECT * FROM stats")
+    conn.close()
+    print("  wrote multi_table.duckdb (players + stats tables)")
 
 
 def make_synthetic(n: int = 300) -> pl.DataFrame:
@@ -100,6 +139,9 @@ def main() -> None:
 
     print("\n[synthetic]")
     write_formats(make_synthetic(), "synthetic")
+
+    print("\n[multi_table]")
+    make_multi_table_duckdb()
 
     print("\nDone.")
 

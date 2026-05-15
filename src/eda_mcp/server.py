@@ -10,7 +10,7 @@ from eda_mcp.correlations import (
     strong_pairs,
 )
 from eda_mcp.plots import generate_plots
-from eda_mcp.reader import load_file
+from eda_mcp.reader import load_file, load_query
 from eda_mcp.report import generate_markdown_report
 from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.utils import handle_errors
@@ -37,10 +37,10 @@ def load_dataset(file_path: str, table: str | None = None) -> dict:
     (continuous, discrete, categorical, binary, temporal, high_cardinality),
     missing value counts and percentages per column.
 
-    Supports CSV, Parquet, Excel (.xlsx/.xls), JSON, NDJSON, Avro, and SQLite
-    (.db/.sqlite). For SQLite files with multiple tables, pass the table name
-    via `table`. If omitted and the database has exactly one table, it is loaded
-    automatically.
+    Supports CSV, Parquet, Excel (.xlsx/.xls), JSON, NDJSON, Avro, SQLite
+    (.db/.sqlite), and DuckDB (.duckdb). For multi-table databases, pass the
+    table name via `table`. If omitted and the database has exactly one table,
+    it is loaded automatically.
     """
     df = load_file(file_path, table)
     n = df.shape[0]
@@ -64,7 +64,74 @@ def load_dataset(file_path: str, table: str | None = None) -> dict:
 
 @mcp.tool()
 @handle_errors
-def get_column_summary(file_path: str, column: str, table: str | None = None) -> dict:
+def query_dataset(
+    query: str,
+    db_path: str | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """
+    Run a DuckDB SQL query and return a structural overview of the result,
+    identical to load_dataset. Use this instead of load_dataset when your
+    data comes from a SQL query, a remote source, or a DuckDB database.
+
+    query accepts either a SQL statement or a bare file path:
+      "SELECT * FROM 's3://bucket/sales.parquet' WHERE year=2024"
+      "SELECT * FROM read_parquet('s3://bucket/data/', hive_partitioning=true)"
+      "C:/data/sales.parquet"  -- bare path, wrapped automatically
+
+    Cross-file joins are supported — DuckDB can mix any readable sources in one
+    query:
+      "SELECT c.*, o.amount FROM 'customers.csv' c JOIN sqlite_scan('sales.db', 'orders') o ON c.id = o.customer_id"
+      "SELECT * FROM 'users.parquet' u JOIN 'events.csv' e ON u.id = e.user_id"
+
+    Remote sources (S3, GCS, HTTP) are supported via DuckDB's httpfs extension.
+    Credentials are read from your environment (AWS_ACCESS_KEY_ID, etc.).
+
+    db_path: optional path to a local .duckdb database file to query against.
+    output_path: where to save the result as Parquet (default: system temp dir).
+
+    Pass result_path from the response to any other tool — get_column_summary,
+    get_all_summaries, get_correlations, generate_report — exactly like file_path.
+    """
+    import os
+    import tempfile
+
+    df = load_query(query, db_path)
+
+    n = df.shape[0]
+    if n == 0:
+        return {"error": "Query returned 0 rows — check join conditions, filters, or key compatibility."}
+
+    if output_path is None:
+        output_path = os.path.join(tempfile.gettempdir(), "eda_query_result.parquet")
+    df.write_parquet(output_path)
+    duplicate_rows = int(df.is_duplicated().sum())
+    return {
+        "result_path": output_path,
+        "query": query,
+        "rows": n,
+        "columns": df.shape[1],
+        "duplicate_rows": duplicate_rows,
+        "duplicate_pct": round(duplicate_rows / n * 100, 2) if n > 0 else 0.0,
+        "column_names": df.columns,
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "classifications": {col: classify_column(df[col]) for col in df.columns},
+        "missing_counts": {col: df[col].null_count() for col in df.columns},
+        "missing_pct": {
+            col: round(df[col].null_count() / n * 100, 2) if n > 0 else 0.0
+            for col in df.columns
+        },
+    }
+
+
+@mcp.tool()
+@handle_errors
+def get_column_summary(
+    file_path: str,
+    column: str,
+    table: str | None = None,
+    classification: str | None = None,
+) -> dict:
     """
     Return full summary statistics for a single column. The column type is
     auto-detected and the appropriate statistics are computed:
@@ -81,13 +148,22 @@ def get_column_summary(file_path: str, column: str, table: str | None = None) ->
 
     Use this to investigate a specific column in depth after calling load_dataset
     to identify columns of interest.
+
+    classification: optional override for the auto-detected column type. Use when
+    the classifier gets it wrong — e.g. pass "categorical" to get value counts on
+    a column detected as discrete, or "continuous" to get distribution stats on a
+    column detected as high_cardinality. Valid values: continuous, discrete,
+    categorical, binary, temporal, high_cardinality. Invalid overrides, dtype
+    mismatches (e.g. "continuous" on a string column), and "binary" on a column
+    with more than 2 unique values are rejected with a warning and fall back to
+    auto-detection.
     """
     df = load_file(file_path, table)
     if column not in df.columns:
         return {
             "error": f"Column '{column}' not found. Available columns: {df.columns}"
         }
-    return get_summary(df[column])
+    return get_summary(df[column], classification)
 
 
 @mcp.tool()
@@ -205,7 +281,9 @@ def get_correlations(
 
 @mcp.tool()
 @handle_errors
-def generate_report(file_path: str, output_dir: str | None = None, table: str | None = None) -> dict:
+def generate_report(
+    file_path: str, output_dir: str | None = None, table: str | None = None
+) -> dict:
     """
     Generate a complete EDA markdown report for the entire dataset. This is the
     main tool to call for a thorough, end-to-end analysis. The report includes:
@@ -225,7 +303,9 @@ def generate_report(file_path: str, output_dir: str | None = None, table: str | 
     get_diagnostic_plot instead of running the full report.
     """
     df = load_file(file_path, table)
-    path = generate_markdown_report(df, file_path, _resolve_output_dir(file_path, output_dir))
+    path = generate_markdown_report(
+        df, file_path, _resolve_output_dir(file_path, output_dir)
+    )
     return {"path": path}
 
 

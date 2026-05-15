@@ -47,8 +47,10 @@ No data quality issues detected.
 {% for col in column_reports %}
 ### {{ col.name }} [{{ col.classification }}]
 
+{% if col.stats_table %}
 {{ col.stats_table }}
 
+{% endif %}
 {% if col.top_counts_table %}
 **Top value counts:**
 
@@ -78,8 +80,7 @@ Numeric columns: {{ corr.columns | join(', ') }}
 
 | Column A | Column B | Spearman ρ | Pearson r | Flag |
 |---|---|---|---|---|
-{% for pair in corr.strong_pairs %}
-| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.spearman }} | {{ pair.pearson }} | {{ pair.flag or '—' }} |
+{% for pair in corr.strong_pairs %}| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.spearman }} | {{ pair.pearson }} | {{ pair.flag or '—' }} |
 {% endfor %}
 
 {% for pair in corr.strong_pairs %}
@@ -127,6 +128,17 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
     for col in df.columns:
         summary = summaries[col]
         classification = summary.get("classification", "unknown")
+
+        if df[col].null_count() == rows:
+            column_reports.append({
+                "name": col,
+                "classification": classification,
+                "stats_table": None,
+                "top_counts_table": None,
+                "plot_path": None,
+                "interpretation": f"{col} contains no data — all {rows} values are missing.",
+            })
+            continue
 
         try:
             plot_path = generate_plots(df[col], col, classification, str(images_dir))

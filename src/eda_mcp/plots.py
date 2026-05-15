@@ -76,7 +76,7 @@ def _plot_continuous(series: pl.Series, column_name: str, out_path: str) -> None
 
 def _plot_discrete(series: pl.Series, column_name: str, out_path: str) -> None:
     arr = series.drop_nulls().to_numpy()
-    vc = series.value_counts(sort=True)
+    vc = series.value_counts(sort=False).sort(series.name)
     val_col = vc.columns[0]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))

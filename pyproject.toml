@@ -18,6 +18,8 @@ dependencies = [
     "scipy",
     "jinja2",
     "fastexcel",
+    "duckdb",
+    "pyarrow",
 ]
 
 [dependency-groups]

@@ -214,9 +214,35 @@ def _temporal_stats(series: pl.Series) -> dict:
     }
 
 
-def get_summary(series: pl.Series) -> dict:
+_VALID_CLASSIFICATIONS = {"continuous", "discrete", "categorical", "binary", "temporal", "high_cardinality"}
+
+_NUMERIC_DTYPES = (*_INTEGER_TYPES, *_FLOAT_TYPES)
+_CLASSIFICATION_REQUIRES = {
+    "continuous": _NUMERIC_DTYPES,
+    "discrete": _NUMERIC_DTYPES,
+    "temporal": (pl.Date, pl.Datetime),
+}
+
+
+def _validate_classification_override(series: pl.Series, classification: str) -> str | None:
+    if classification not in _VALID_CLASSIFICATIONS:
+        warn(f"Invalid classification override '{classification}'. Valid values: {sorted(_VALID_CLASSIFICATIONS)}. Falling back to auto-detection.")
+        return None
+    required = _CLASSIFICATION_REQUIRES.get(classification)
+    if required and not isinstance(series.dtype, required) and series.dtype not in required:
+        warn(f"Cannot apply '{classification}' to '{series.name}' (dtype {series.dtype}). Falling back to auto-detection.")
+        return None
+    if classification == "binary" and series.drop_nulls().n_unique() != 2:
+        warn(f"Cannot apply 'binary' to '{series.name}' — {series.drop_nulls().n_unique()} unique values found, expected 2. Falling back to auto-detection.")
+        return None
+    return classification
+
+
+def get_summary(series: pl.Series, classification: str | None = None) -> dict:
     n = len(series)
-    classification = classify_column(series)
+    if classification is not None:
+        classification = _validate_classification_override(series, classification)
+    classification = classification or classify_column(series)
     missing_count = series.null_count()
 
     summary: dict = {

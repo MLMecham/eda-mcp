@@ -17,7 +17,7 @@ _MAX_SCATTER = 10
 
 
 def numeric_columns(df: pl.DataFrame) -> list[str]:
-    return [col for col in df.columns if classify_column(df[col]) in _NUMERIC]
+    return [col for col in df.columns if classify_column(df[col]) in _NUMERIC and df[col].null_count() < len(df)]
 
 
 def compute_correlations(df: pl.DataFrame, cols: list[str]) -> tuple[dict, dict]:

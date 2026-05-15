@@ -32,6 +32,7 @@ Thumbs.db
 *.png
 *_eda_report.md
 data/generated/
+data/output/
 
 # Project
 specs.txt
