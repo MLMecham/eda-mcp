@@ -4,7 +4,7 @@ from importlib.metadata import version
 
 __version__ = version("eda-mcp")
 
-from eda_mcp.reader import load_file
+from eda_mcp.reader import load_file, load_query
 from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.plots import generate_plots
 from eda_mcp.report import generate_markdown_report
@@ -15,6 +15,7 @@ __all__ = [
     "__version__",
     # Data loading
     "load_file",
+    "load_query",
     # Statistics
     "classify_column",
     "get_summary",

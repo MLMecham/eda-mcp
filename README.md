@@ -42,6 +42,32 @@ Add this to your `claude_desktop_config.json`:
 
 Restart Claude Desktop. The tools will appear automatically.
 
+> **Tip:** Add `--refresh` to always pull the latest version from PyPI on startup:
+> ```json
+> "args": ["--refresh", "eda-mcp"]
+> ```
+
+---
+
+## Troubleshooting
+
+**Tools not appearing after install or update**
+
+uvx caches the installed version and won't update automatically. Force a refresh:
+
+```bash
+uvx --refresh eda-mcp --help
+```
+
+Then fully quit and reopen Claude Desktop (not just close the window).
+
+**Check server logs**
+
+If the tools still don't appear, check the MCP server logs:
+
+- **Windows:** `%APPDATA%\Claude\logs\mcp-server-eda-mcp.log`
+- **Mac:** `~/Library/Logs/Claude/mcp-server-eda-mcp.log`
+
 ---
 
 ## Tools
@@ -49,7 +75,8 @@ Restart Claude Desktop. The tools will appear automatically.
 | Tool | Description |
 |---|---|
 | `load_dataset` | Load a file and get column names, types, classifications, and missing value counts. Start here. |
-| `get_column_summary` | Full statistics for a single column — five-number summary, skewness, kurtosis, outlier count, normality test. |
+| `query_dataset` | Run a DuckDB SQL query and return the same overview as `load_dataset`. Supports local files, remote sources (S3, GCS, HTTP), SQLite, and cross-file joins. Result is saved to Parquet for use with other tools. |
+| `get_column_summary` | Full statistics for a single column — five-number summary, skewness, kurtosis, outlier count, normality test. Accepts an optional `classification` override. |
 | `get_all_summaries` | Summary statistics for every column at once, keyed by column name. |
 | `get_diagnostic_plot` | Generate a diagnostic plot for a single column. Plot type is auto-selected by classification. |
 | `get_correlations` | Pearson and Spearman correlation matrices, a heatmap, and scatter plots for strongly correlated pairs. |
@@ -68,10 +95,26 @@ Restart Claude Desktop. The tools will appear automatically.
 | Newline-delimited JSON | `.ndjson` |
 | Avro | `.avro` |
 | SQLite | `.db`, `.sqlite` |
+| DuckDB | `.duckdb` |
 
 String columns are automatically coerced to better types on load (integers, floats, dates) where unambiguous.
 
-For SQLite files with multiple tables, pass the `table` parameter to specify which one.
+For SQLite and DuckDB files with multiple tables, pass the `table` parameter to specify which one. If the database has exactly one table it is loaded automatically.
+
+### Querying with SQL
+
+Use `query_dataset` for SQL-based loading, remote sources, or cross-file joins:
+
+```sql
+-- Filter before analysis
+SELECT * FROM 's3://bucket/sales.parquet' WHERE year = 2024
+
+-- Cross-file join
+SELECT t.*, p.bst FROM 'trainers.csv' t JOIN 'pokemon.parquet' p ON t.pokemon = p.name
+
+-- Query a DuckDB database
+SELECT * FROM my_table  -- with db_path pointing to your .duckdb file
+```
 
 ---
 
