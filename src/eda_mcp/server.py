@@ -424,7 +424,7 @@ def compare_distributions(
 
     Returns:
     - shape: row and column count for each source
-    - only_in_a / only_in_b: columns that appear in one source but not the other
+    - only_in_{label_a} / only_in_{label_b}: columns that appear in one source but not the other
     - per_column_diffs: for each shared column, the delta between the two sources —
       numeric deltas (mean_delta, median_delta, std_delta, outlier_pct_delta,
       missing_pct_delta), classification changes, and mode changes for categoricals
