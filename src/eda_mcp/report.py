@@ -5,10 +5,19 @@ import polars as pl
 from jinja2 import Template
 
 from eda_mcp.correlations import (
+    categorical_columns,
     compute_correlations,
+    compute_cramers_v,
+    compute_eta_squared,
     numeric_columns,
+    plot_boxplot,
+    plot_categorical_heatmap,
+    plot_grouped_bar,
     plot_heatmap,
+    plot_mixed_heatmap,
     plot_scatter,
+    strong_categorical_pairs,
+    strong_mixed_pairs,
     strong_pairs,
 )
 from eda_mcp.plots import generate_plots
@@ -68,36 +77,90 @@ No data quality issues detected.
 {% endfor %}
 
 {% if corr %}
-## Correlation Analysis
+## Association Analysis
 
-Numeric columns: {{ corr.columns | join(', ') }}
+{% if corr.numeric %}
+### Numeric Correlations
 
-{% if corr.heatmap %}
-![Spearman Correlation Heatmap]({{ corr.heatmap }})
+Columns: {{ corr.numeric.columns | join(', ') }}
+
+{% if corr.numeric.heatmap %}
+![Spearman Correlation Heatmap]({{ corr.numeric.heatmap }})
 
 {% endif %}
-{% if corr.strong_pairs %}
-### Strong Correlations (|ρ| ≥ {{ corr.threshold }})
-
+{% if corr.numeric.strong_pairs %}
 | Column A | Column B | Spearman ρ | Pearson r | Flag |
 |---|---|---|---|---|
-{% for pair in corr.strong_pairs %}| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.spearman }} | {{ pair.pearson }} | {{ pair.flag or '—' }} |
+{% for pair in corr.numeric.strong_pairs %}| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.spearman }} | {{ pair.pearson }} | {{ pair.flag or '—' }} |
 {% endfor %}
 
-{% for pair in corr.strong_pairs %}
-{% if pair.scatter_path %}
+{% for pair in corr.numeric.strong_pairs %}{% if pair.scatter_path %}
 ![{{ pair.column_a }} vs {{ pair.column_b }}]({{ pair.scatter_path }})
 
-{% endif %}
-{% endfor %}
+{% endif %}{% endfor %}
 {% else %}
-No correlations found above threshold {{ corr.threshold }}.
+No numeric correlations above threshold {{ corr.numeric.threshold }}.
 {% endif %}
+{% endif %}
+
+{% if corr.categorical %}
+### Categorical Associations (Cramér's V)
+
+Columns: {{ corr.categorical.columns | join(', ') }}
+
+{% if corr.categorical.heatmap %}
+![Cramér's V Heatmap]({{ corr.categorical.heatmap }})
+
+{% endif %}
+{% if corr.categorical.strong_pairs %}
+| Column A | Column B | Cramér's V | Flag |
+|---|---|---|---|
+{% for pair in corr.categorical.strong_pairs %}| {{ pair.column_a }} | {{ pair.column_b }} | {{ pair.cramers_v }} | {{ pair.flag or '—' }} |
+{% endfor %}
+
+{% for pair in corr.categorical.strong_pairs %}{% if pair.grouped_bar_path %}
+![{{ pair.column_a }} vs {{ pair.column_b }}]({{ pair.grouped_bar_path }})
+
+{% endif %}{% endfor %}
+{% else %}
+No categorical associations above threshold {{ corr.categorical.threshold }}.
+{% endif %}
+{% endif %}
+
+{% if corr.mixed %}
+### Mixed Associations (Eta-squared)
+
+{% if corr.mixed.heatmap %}
+![Eta-squared Heatmap]({{ corr.mixed.heatmap }})
+
+{% endif %}
+{% if corr.mixed.strong_pairs %}
+| Categorical | Numeric | η² | Flag |
+|---|---|---|---|
+{% for pair in corr.mixed.strong_pairs %}| {{ pair.categorical }} | {{ pair.numeric }} | {{ pair.eta_squared }} | {{ pair.flag or '—' }} |
+{% endfor %}
+
+{% for pair in corr.mixed.strong_pairs %}{% if pair.boxplot_path %}
+![{{ pair.numeric }} by {{ pair.categorical }}]({{ pair.boxplot_path }})
+
+{% endif %}{% endfor %}
+{% else %}
+No mixed associations above threshold {{ corr.mixed.threshold }}.
+{% endif %}
+{% endif %}
+
 {% endif %}
 """)
 
 
-def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) -> str:
+def generate_markdown_report(
+    df: pl.DataFrame,
+    file_path: str,
+    output_dir: str,
+    numeric: bool = True,
+    categorical: bool = True,
+    mixed: bool = True,
+) -> str:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     filename = Path(file_path).stem
@@ -160,7 +223,7 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
             "interpretation": _interpret(col, summary),
         })
 
-    corr = _build_correlation_section(df, filename, corr_dir)
+    corr = _build_correlation_section(df, filename, corr_dir, numeric, categorical, mixed)
 
     out_path = str(Path(output_dir) / f"{filename}_eda_report.md")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -186,40 +249,86 @@ def generate_markdown_report(df: pl.DataFrame, file_path: str, output_dir: str) 
 
 
 def _build_correlation_section(
-    df: pl.DataFrame, filename: str, corr_dir: Path
+    df: pl.DataFrame,
+    filename: str,
+    corr_dir: Path,
+    numeric: bool = True,
+    categorical: bool = True,
+    mixed: bool = True,
 ) -> dict | None:
+    numeric_threshold = 0.5
+    categorical_threshold = 0.3
+    mixed_threshold = 0.1
+    top_n = 3
+    result = {}
+
     try:
-        cols = numeric_columns(df)
-        if len(cols) < 2:
-            return None
+        if numeric:
+            num_cols = numeric_columns(df)
+            if len(num_cols) >= 2:
+                pearson, spearman = compute_correlations(df, num_cols)
+                pairs = strong_pairs(pearson, spearman, num_cols, numeric_threshold, top_n)
+                heatmap_abs = plot_heatmap(spearman, num_cols, str(corr_dir))
+                for pair in pairs:
+                    try:
+                        scatter_abs = plot_scatter(df, pair["column_a"], pair["column_b"], pair["spearman"], str(corr_dir))
+                        pair["scatter_path"] = f"{filename}_correlations/{Path(scatter_abs).name}"
+                    except Exception as e:
+                        warn(f"Scatter plot failed for {pair['column_a']} vs {pair['column_b']}: {e}")
+                        pair["scatter_path"] = None
+                result["numeric"] = {
+                    "columns": num_cols,
+                    "strong_pairs": pairs,
+                    "heatmap": f"{filename}_correlations/{Path(heatmap_abs).name}",
+                    "threshold": numeric_threshold,
+                }
 
-        threshold = 0.5
-        pearson, spearman = compute_correlations(df, cols)
-        pairs = strong_pairs(pearson, spearman, cols, threshold)
+        if categorical:
+            cat_cols = categorical_columns(df)
+            if len(cat_cols) >= 2:
+                cramers = compute_cramers_v(df, cat_cols)
+                pairs = strong_categorical_pairs(cramers, cat_cols, categorical_threshold, top_n)
+                heatmap_abs = plot_categorical_heatmap(cramers, cat_cols, str(corr_dir))
+                for pair in pairs:
+                    try:
+                        bar_abs = plot_grouped_bar(df, pair["column_a"], pair["column_b"], pair["cramers_v"], str(corr_dir))
+                        pair["grouped_bar_path"] = f"{filename}_correlations/{Path(bar_abs).name}"
+                    except Exception as e:
+                        warn(f"Grouped bar failed for {pair['column_a']} vs {pair['column_b']}: {e}")
+                        pair["grouped_bar_path"] = None
+                result["categorical"] = {
+                    "columns": cat_cols,
+                    "strong_pairs": pairs,
+                    "heatmap": f"{filename}_correlations/{Path(heatmap_abs).name}",
+                    "threshold": categorical_threshold,
+                }
 
-        heatmap_abs = plot_heatmap(spearman, cols, str(corr_dir))
-        heatmap_rel = f"{filename}_correlations/{Path(heatmap_abs).name}"
+        if mixed:
+            num_cols = numeric_columns(df)
+            cat_cols = categorical_columns(df)
+            if num_cols and cat_cols:
+                eta = compute_eta_squared(df, num_cols, cat_cols)
+                pairs = strong_mixed_pairs(eta, num_cols, cat_cols, mixed_threshold, top_n)
+                heatmap_abs = plot_mixed_heatmap(eta, num_cols, cat_cols, str(corr_dir))
+                for pair in pairs:
+                    try:
+                        box_abs = plot_boxplot(df, pair["numeric"], pair["categorical"], pair["eta_squared"], str(corr_dir))
+                        pair["boxplot_path"] = f"{filename}_correlations/{Path(box_abs).name}"
+                    except Exception as e:
+                        warn(f"Boxplot failed for {pair['numeric']} vs {pair['categorical']}: {e}")
+                        pair["boxplot_path"] = None
+                result["mixed"] = {
+                    "numeric_columns": num_cols,
+                    "categorical_columns": cat_cols,
+                    "strong_pairs": pairs,
+                    "heatmap": f"{filename}_correlations/{Path(heatmap_abs).name}",
+                    "threshold": mixed_threshold,
+                }
 
-        for pair in pairs:
-            try:
-                scatter_abs = plot_scatter(
-                    df, pair["column_a"], pair["column_b"],
-                    pair["spearman"], str(corr_dir)
-                )
-                pair["scatter_path"] = f"{filename}_correlations/{Path(scatter_abs).name}"
-            except Exception as e:
-                warn(f"Scatter plot failed for {pair['column_a']} vs {pair['column_b']}: {e}")
-                pair["scatter_path"] = None
-
-        return {
-            "columns": cols,
-            "strong_pairs": pairs,
-            "heatmap": heatmap_rel,
-            "threshold": threshold,
-        }
     except Exception as e:
         warn(f"Correlation analysis failed: {e}")
-        return None
+
+    return result if result else None
 
 
 def _collect_flags(summaries: dict) -> list[str]:

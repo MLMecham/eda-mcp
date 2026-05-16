@@ -4,10 +4,19 @@ import polars as pl
 from mcp.server.fastmcp import FastMCP
 
 from eda_mcp.correlations import (
+    categorical_columns,
     compute_correlations,
+    compute_cramers_v,
+    compute_eta_squared,
     numeric_columns,
+    plot_boxplot,
+    plot_categorical_heatmap,
+    plot_grouped_bar,
     plot_heatmap,
+    plot_mixed_heatmap,
     plot_scatter,
+    strong_categorical_pairs,
+    strong_mixed_pairs,
     strong_pairs,
 )
 from eda_mcp.plots import generate_plots
@@ -238,70 +247,116 @@ def get_diagnostic_plot(
 def get_correlations(
     file_path: str,
     output_dir: str | None = None,
-    threshold: float = 0.5,
+    numeric_threshold: float = 0.5,
+    categorical_threshold: float = 0.3,
+    mixed_threshold: float = 0.1,
+    top_n: int = 3,
     table: str | None = None,
     plots: bool = False,
+    numeric: bool = True,
+    categorical: bool = True,
+    mixed: bool = True,
 ) -> dict:
     """
-    Compute pairwise correlations between all numeric columns in the dataset.
+    Compute associations between columns in the dataset. Three association
+    types are supported and can be toggled independently:
 
-    Returns both Pearson and Spearman correlation matrices, the strongest pairs
-    above the threshold (sorted by absolute Spearman correlation, max 10),
-    and highly correlated flags for pairs with |ρ| >= 0.9.
+    numeric=True: Pearson and Spearman correlations between continuous and
+    discrete columns. Returns both matrices and strong pairs above threshold.
 
-    Only continuous and discrete columns are included — categorical, binary,
-    temporal, and high_cardinality columns are excluded automatically.
+    categorical=True: Cramér's V association between categorical and binary
+    columns. Ranges from 0 (no association) to 1 (perfect association).
+    Strong pairs flagged at V >= 0.7.
 
-    threshold controls which pairs are flagged as strong (default 0.5). Set
-    higher e.g. 0.7 for only strong correlations, lower e.g. 0.3 to cast a
-    wider net.
+    mixed=True: Eta-squared (η²) between categorical and numeric columns.
+    Measures how much variance in the numeric column is explained by the
+    categorical grouping. Ranges 0-1. Strong pairs flagged at η² >= 0.14
+    (conventional medium effect size).
 
-    plots: set to True to generate a Spearman heatmap and scatter plots for
-    strong pairs. Plots are saved to output_dir/correlations/. Defaults to
-    False — omit when you only need the numbers.
+    numeric_threshold: minimum Spearman |ρ| to include in numeric strong_pairs (default 0.5).
+    categorical_threshold: minimum Cramér's V to include in categorical strong_pairs (default 0.3).
+    mixed_threshold: minimum η² to include in mixed strong_pairs (default 0.1).
+    top_n: number of top pairs to return per type (default 3).
+    plots: set to True to generate heatmaps saved to {stem}_correlations/.
+    Defaults to False — omit when you only need the numbers.
     """
     df = load_file(file_path, table)
-    cols = numeric_columns(df)
-
-    if len(cols) < 2:
-        return {"error": "Need at least 2 numeric columns to compute correlations."}
-
-    pearson, spearman = compute_correlations(df, cols)
-    pairs = strong_pairs(pearson, spearman, cols, threshold)
-
-    if not plots:
-        return {
-            "numeric_columns": cols,
-            "pearson": pearson,
-            "spearman": spearman,
-            "strong_pairs": pairs,
-        }
-
     stem = Path(file_path.strip()).stem
     out = str(Path(_resolve_output_dir(file_path, output_dir)) / f"{stem}_correlations")
-    heatmap_path = plot_heatmap(spearman, cols, out)
+    result = {}
+    num_cols = numeric_columns(df) if (numeric or mixed) else []
+    cat_cols = categorical_columns(df) if (categorical or mixed) else []
 
-    scatter_paths = []
-    for pair in pairs:
-        path = plot_scatter(
-            df, pair["column_a"], pair["column_b"], pair["spearman"], out
-        )
-        scatter_paths.append(path)
+    if numeric:
+        if len(num_cols) >= 2:
+            pearson, spearman = compute_correlations(df, num_cols)
+            pairs = strong_pairs(pearson, spearman, num_cols, numeric_threshold, top_n)
+            result["numeric"] = {
+                "columns": num_cols,
+                "pearson": pearson,
+                "spearman": spearman,
+                "strong_pairs": pairs,
+            }
+            if plots:
+                heatmap = plot_heatmap(spearman, num_cols, out)
+                scatter_paths = [
+                    plot_scatter(df, p["column_a"], p["column_b"], p["spearman"], out)
+                    for p in pairs
+                ]
+                result["numeric"]["heatmap"] = heatmap
+                result["numeric"]["scatter_plots"] = scatter_paths
+        else:
+            result["numeric"] = {"error": "Need at least 2 numeric columns."}
 
-    return {
-        "numeric_columns": cols,
-        "pearson": pearson,
-        "spearman": spearman,
-        "strong_pairs": pairs,
-        "heatmap": heatmap_path,
-        "scatter_plots": scatter_paths,
-    }
+    if categorical:
+        if len(cat_cols) >= 2:
+            cramers = compute_cramers_v(df, cat_cols)
+            pairs = strong_categorical_pairs(cramers, cat_cols, categorical_threshold, top_n)
+            result["categorical"] = {
+                "columns": cat_cols,
+                "cramers_v": cramers,
+                "strong_pairs": pairs,
+            }
+            if plots:
+                result["categorical"]["heatmap"] = plot_categorical_heatmap(cramers, cat_cols, out)
+                result["categorical"]["grouped_bars"] = [
+                    plot_grouped_bar(df, p["column_a"], p["column_b"], p["cramers_v"], out)
+                    for p in pairs
+                ]
+        else:
+            result["categorical"] = {"error": "Need at least 2 categorical columns."}
+
+    if mixed:
+        if num_cols and cat_cols:
+            eta = compute_eta_squared(df, num_cols, cat_cols)
+            pairs = strong_mixed_pairs(eta, num_cols, cat_cols, mixed_threshold, top_n)
+            result["mixed"] = {
+                "numeric_columns": num_cols,
+                "categorical_columns": cat_cols,
+                "eta_squared": eta,
+                "strong_pairs": pairs,
+            }
+            if plots:
+                result["mixed"]["heatmap"] = plot_mixed_heatmap(eta, num_cols, cat_cols, out)
+                result["mixed"]["boxplots"] = [
+                    plot_boxplot(df, p["numeric"], p["categorical"], p["eta_squared"], out)
+                    for p in pairs
+                ]
+        else:
+            result["mixed"] = {"error": "Need at least 1 numeric and 1 categorical column."}
+
+    return result
 
 
 @mcp.tool()
 @handle_errors
 def generate_report(
-    file_path: str, output_dir: str | None = None, table: str | None = None
+    file_path: str,
+    output_dir: str | None = None,
+    table: str | None = None,
+    numeric: bool = True,
+    categorical: bool = True,
+    mixed: bool = True,
 ) -> dict:
     """
     Generate a complete EDA markdown report for the entire dataset. This is the
@@ -314,16 +369,19 @@ def generate_report(
     - Per-column variable summaries: statistics table, diagnostic plot image,
       and a 2-3 sentence plain english interpretation of the distribution shape,
       outliers, and data quality for each column
+    - Association analysis: numeric correlations (Pearson + Spearman), categorical
+      associations (Cramér's V), and mixed associations (eta-squared). Each section
+      can be toggled off with numeric=False, categorical=False, or mixed=False.
 
-    Saves the report as {filename}_eda_report.md in output_dir alongside the
-    diagnostic plot PNGs. Returns the path to the saved report file.
+    Saves the report as {filename}_eda_report.md in output_dir. Returns the path.
 
     For quick inspection of a single column use get_column_summary or
     get_diagnostic_plot instead of running the full report.
     """
     df = load_file(file_path, table)
     path = generate_markdown_report(
-        df, file_path, _resolve_output_dir(file_path, output_dir)
+        df, file_path, _resolve_output_dir(file_path, output_dir),
+        numeric=numeric, categorical=categorical, mixed=mixed,
     )
     return {"path": path}
 

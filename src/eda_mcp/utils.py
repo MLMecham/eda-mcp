@@ -1,7 +1,33 @@
 from contextvars import ContextVar
 from functools import wraps
+from typing import Literal
+
+import polars as pl
 
 _warnings_var: ContextVar[list[str]] = ContextVar("warnings")
+
+
+def sample(
+    df: pl.DataFrame,
+    n: int = 10_000,
+    strategy: Literal["random", "stratified", "temporal", "outlier_preserving"] = "random",
+    seed: int = 42,
+) -> pl.DataFrame:
+    """
+    Sample a DataFrame down to at most n rows. Returns the full DataFrame unchanged
+    if it already has n or fewer rows.
+
+    strategy:
+      "random" (default): uniform random sample. Fast and sufficient for most plots.
+      "stratified": not yet implemented — falls back to random.
+      "temporal": not yet implemented — falls back to random.
+      "outlier_preserving": not yet implemented — falls back to random.
+    """
+    if len(df) <= n:
+        return df
+    if strategy != "random":
+        warn(f"Sampling strategy '{strategy}' is not yet implemented — falling back to random.")
+    return df.sample(n, seed=seed)
 
 
 def warn(msg: str) -> None:

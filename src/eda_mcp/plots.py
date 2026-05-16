@@ -9,6 +9,8 @@ import polars as pl
 import seaborn as sns
 from scipy import stats as scipy_stats
 
+from eda_mcp.utils import sample
+
 
 def generate_plots(
     series: pl.Series,
@@ -47,7 +49,9 @@ def generate_plots(
 
 
 def _plot_continuous(series: pl.Series, column_name: str, out_path: str) -> None:
-    arr = series.drop_nulls().to_numpy()
+    clean = series.drop_nulls()
+    arr = clean.to_numpy()
+    arr_sampled = sample(clean).to_numpy()
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle(f"{column_name} [continuous]", fontsize=14)
@@ -60,7 +64,7 @@ def _plot_continuous(series: pl.Series, column_name: str, out_path: str) -> None
     axes[0, 1].set_title("Boxplot")
     axes[0, 1].set_xlabel(column_name)
 
-    scipy_stats.probplot(arr, plot=axes[1, 0])
+    scipy_stats.probplot(arr_sampled, plot=axes[1, 0])
     axes[1, 0].set_title("QQ Plot")
 
     sorted_arr = np.sort(arr)

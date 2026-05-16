@@ -8,7 +8,13 @@ from eda_mcp.reader import load_file, load_query
 from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.plots import generate_plots
 from eda_mcp.report import generate_markdown_report
-from eda_mcp.correlations import compute_correlations, numeric_columns
+from eda_mcp.correlations import (
+    categorical_columns,
+    compute_correlations,
+    compute_cramers_v,
+    compute_eta_squared,
+    numeric_columns,
+)
 
 __all__ = [
     # Version
@@ -24,6 +30,9 @@ __all__ = [
     # Reports
     "generate_markdown_report",
     # Correlations
+    "categorical_columns",
     "compute_correlations",
+    "compute_cramers_v",
+    "compute_eta_squared",
     "numeric_columns",
 ]
