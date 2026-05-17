@@ -25,10 +25,40 @@ from eda_mcp.report import generate_markdown_report
 from eda_mcp.stats import classify_column, get_summary
 from eda_mcp.utils import handle_errors
 
-mcp = FastMCP("eda-mcp")
+mcp = FastMCP(
+    "eda-mcp",
+    instructions=(
+        "This server runs locally on the user's machine as a stdio process. "
+        "All file paths are local absolute paths on the user's filesystem — "
+        "you have direct access to local files, no upload or URL is needed. "
+        "Always use absolute paths when calling tools. "
+        "Before calling generate_report, ask the user where they want the report saved (output_dir). "
+        "The default saves to an output/ folder next to the source file — confirm this is acceptable first."
+    ),
+)
 
-_COMPACT_KEYS = {"row_count", "missing_pct", "mean", "median", "std", "min", "Q1", "Q3", "max", "skewness", "outlier_pct"}
-_NUMERIC_DIFF_KEYS = ["mean", "median", "std", "min", "max", "outlier_pct", "missing_pct"]
+_COMPACT_KEYS = {
+    "row_count",
+    "missing_pct",
+    "mean",
+    "median",
+    "std",
+    "min",
+    "Q1",
+    "Q3",
+    "max",
+    "skewness",
+    "outlier_pct",
+}
+_NUMERIC_DIFF_KEYS = [
+    "mean",
+    "median",
+    "std",
+    "min",
+    "max",
+    "outlier_pct",
+    "missing_pct",
+]
 
 
 def _dataset_overview(df: pl.DataFrame) -> dict:
@@ -63,21 +93,20 @@ def _resolve_output_dir(file_path: str, output_dir: str | None) -> str:
 @handle_errors
 def load_dataset(file_path: str, table: str | None = None) -> dict:
     """
-    Load a dataset and return a structural overview. Call this first when
-    exploring an unfamiliar dataset — it gives you the shape, column types,
-    classifications, and missing value counts you need to decide what to
-    investigate next.
+    Load a local file and return a structural overview — shape, column types,
+    classifications, missing values, and duplicate counts. Call this first
+    when the data is already on disk and you want to load it all.
 
-    Returns: column names, dtypes, row count, per-column classifications
-    (continuous, discrete, categorical, binary, temporal, high_cardinality),
-    missing value counts and percentages per column. Also returns duplicate_rows
-    (total rows that have at least one duplicate) and extra_rows (rows that would
-    be removed by deduplication — the actionable count).
+    Use query_dataset instead when you need SQL filtering, joins, remote
+    sources (S3, HTTP), or a DuckDB database.
 
-    Supports CSV, Parquet, Excel (.xlsx/.xls), JSON, NDJSON, Avro, SQLite
-    (.db/.sqlite), and DuckDB (.duckdb). For multi-table databases, pass the
-    table name via `table`. If omitted and the database has exactly one table,
-    it is loaded automatically.
+    Supports CSV, Parquet, Excel, JSON, NDJSON, Avro, SQLite (.db/.sqlite),
+    DuckDB (.duckdb). For multi-table databases pass table; auto-selected if
+    only one table exists.
+
+    Returns: column names, dtypes, classifications (continuous, discrete,
+    categorical, binary, temporal, high_cardinality), missing counts,
+    duplicate_rows (all occurrences), extra_rows (removable by dedup).
     """
     df = load_file(file_path, table)
     return {"file_path": file_path, **_dataset_overview(df)}
@@ -91,28 +120,20 @@ def query_dataset(
     output_path: str | None = None,
 ) -> dict:
     """
-    Run a DuckDB SQL query and return a structural overview of the result,
-    identical to load_dataset. Use this instead of load_dataset when your
-    data comes from a SQL query, a remote source, or a DuckDB database.
+    Run a DuckDB SQL query and return the same structural overview as
+    load_dataset. Use this instead of load_dataset when you need filtering,
+    joins, remote sources, or a DuckDB database.
 
-    query accepts either a SQL statement or a bare file path:
-      "SELECT * FROM 's3://bucket/sales.parquet' WHERE year=2024"
-      "SELECT * FROM read_parquet('s3://bucket/data/', hive_partitioning=true)"
-      "C:/data/sales.parquet"  -- bare path, wrapped automatically
+    query accepts a SQL statement or a bare file path (auto-wrapped):
+      "SELECT * FROM 'sales.parquet' WHERE year=2024"
+      "SELECT * FROM 's3://bucket/data.parquet'"
+      "SELECT a.*, b.col FROM 'file1.csv' a JOIN 'file2.parquet' b ON a.id=b.id"
+      "C:/data/sales.parquet"
 
-    Cross-file joins are supported — DuckDB can mix any readable sources in one
-    query:
-      "SELECT c.*, o.amount FROM 'customers.csv' c JOIN sqlite_scan('sales.db', 'orders') o ON c.id = o.customer_id"
-      "SELECT * FROM 'users.parquet' u JOIN 'events.csv' e ON u.id = e.user_id"
+    db_path: path to a .duckdb file when querying named tables inside it.
+    output_path: where to save result as Parquet (default: system temp dir).
 
-    Remote sources (S3, GCS, HTTP) are supported via DuckDB's httpfs extension.
-    Credentials are read from your environment (AWS_ACCESS_KEY_ID, etc.).
-
-    db_path: optional path to a local .duckdb database file to query against.
-    output_path: where to save the result as Parquet (default: system temp dir).
-
-    Pass result_path from the response to any other tool — get_column_summary,
-    get_all_summaries, get_correlations, generate_report — exactly like file_path.
+    Pass result_path to any other tool exactly like file_path.
     """
     import os
     import tempfile
@@ -120,7 +141,9 @@ def query_dataset(
     df = load_query(query, db_path)
 
     if df.shape[0] == 0:
-        return {"error": "Query returned 0 rows — check join conditions, filters, or key compatibility."}
+        return {
+            "error": "Query returned 0 rows — check join conditions, filters, or key compatibility."
+        }
 
     if output_path is None:
         output_path = os.path.join(tempfile.gettempdir(), "eda_query_result.parquet")
@@ -138,33 +161,15 @@ def get_column_summary(
     full_summary: bool = True,
 ) -> dict:
     """
-    Return full summary statistics for a single column. The column type is
-    auto-detected and the appropriate statistics are computed:
+    Return summary statistics for a single column. Stats depend on type:
+    continuous/discrete: five-number summary, mean, std, skewness, kurtosis,
+    outlier count (IQR), normality test. categorical/binary: mode, value counts,
+    class balance. temporal: date range, gap count. high_cardinality: sample only.
 
-    - continuous/discrete: five-number summary, mean, std, skewness with plain
-      english label, kurtosis with label, outlier count (IQR method), zero count,
-      infinite count, normality test (scipy normaltest p-value and result)
-    - categorical: mode, top 10 value counts with percentages
-    - binary: mode, top value counts, class balance ratio with imbalance flag
-      (flagged if majority:minority ratio exceeds 3:1)
-    - temporal: min/max date, date range in days, gap count, most common year
-      and month
-    - high_cardinality: flagged as likely ID or free text with sample values only
-
-    Use this to investigate a specific column in depth after calling load_dataset
-    to identify columns of interest.
-
-    classification: optional override for the auto-detected column type. Use when
-    the classifier gets it wrong — e.g. pass "categorical" to get value counts on
-    a column detected as discrete, or "continuous" to get distribution stats on a
-    column detected as high_cardinality. Valid values: continuous, discrete,
-    categorical, binary, temporal, high_cardinality. Invalid overrides, dtype
-    mismatches (e.g. "continuous" on a string column), and "binary" on a column
-    with more than 2 unique values are rejected with a warning and fall back to
-    auto-detection.
-    full_summary: if True (default), returns all statistics. If False, returns
-    the compact subset used by get_column_summary_by_group — useful for
-    consistency when comparing a single column against grouped results.
+    classification: override auto-detection — e.g. "categorical" on a discrete
+    column for value counts. Valid: continuous, discrete, categorical, binary,
+    temporal, high_cardinality. Invalid overrides fall back with a warning.
+    full_summary: False returns compact subset matching get_column_summary_by_group.
     """
     df = load_file(file_path, table)
     if column not in df.columns:
@@ -172,21 +177,20 @@ def get_column_summary(
             "error": f"Column '{column}' not found. Available columns: {df.columns}"
         }
     summary = get_summary(df[column], classification)
-    return summary if full_summary else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
+    return (
+        summary
+        if full_summary
+        else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
+    )
 
 
 @mcp.tool()
 @handle_errors
 def get_all_summaries(file_path: str, table: str | None = None) -> dict:
     """
-    Return summary statistics for every column in the dataset in a single call,
-    keyed by column name. Each value contains all statistics appropriate for the
-    column's detected type — equivalent to calling get_column_summary once per
-    column.
-
-    Use this for a complete statistical overview of the entire dataset at once.
-    For large datasets with many columns, prefer get_column_summary to inspect
-    individual columns of interest rather than loading everything at once.
+    Return summary statistics for every column at once, keyed by column name.
+    Same output as get_column_summary per column. For large datasets with many
+    columns prefer get_column_summary on specific columns of interest.
     """
     df = load_file(file_path, table)
     results = {}
@@ -201,28 +205,20 @@ def get_all_summaries(file_path: str, table: str | None = None) -> dict:
 @mcp.tool()
 @handle_errors
 def get_diagnostic_plot(
-    file_path: str, column: str, output_dir: str, table: str | None = None, classification: str | None = None
+    file_path: str,
+    column: str,
+    output_dir: str,
+    table: str | None = None,
+    classification: str | None = None,
 ) -> dict:
     """
-    Generate and save a diagnostic plot for a single column as a PNG file.
-    The plot type is automatically selected based on the column's classification:
+    Generate and save a diagnostic PNG for a single column. Plot type is
+    auto-selected: continuous → histogram/KDE/boxplot/QQ/ECDF, discrete →
+    value counts + boxplot, categorical → horizontal bar, binary → class
+    balance bar, temporal → time series + monthly bar, high_cardinality →
+    no plot. Saves to output_dir/{column}_diagnostics.png.
 
-    - continuous: 2x2 panel — histogram with KDE overlay, boxplot with outliers,
-      QQ plot with reference line, ECDF
-    - discrete: bar chart of value counts and boxplot side by side
-    - categorical: horizontal bar chart of top 20 values with percentage labels
-    - binary: bar chart of class balance with proportion labels; bars are red
-      if the majority:minority ratio exceeds 3:1
-    - temporal: line plot of counts over time and bar chart of counts by month
-    - high_cardinality: no plot is generated; a message is returned instead
-
-    Saves the PNG to output_dir/{column}_diagnostics.png and returns the file
-    path. Use output_dir to control where plots land — the same folder as the
-    dataset or a dedicated output directory both work well.
-
-    classification: optional override for the auto-detected column type. Same
-    validation rules as get_column_summary — invalid overrides fall back to
-    auto-detection with a warning.
+    classification: override auto-detection, same rules as get_column_summary.
     """
     df = load_file(file_path, table)
     if column not in df.columns:
@@ -231,6 +227,7 @@ def get_diagnostic_plot(
         }
     if classification is not None:
         from eda_mcp.stats import _validate_classification_override
+
         classification = _validate_classification_override(df[column], classification)
     if classification is None:
         classification = classify_column(df[column])
@@ -258,27 +255,18 @@ def get_correlations(
     mixed: bool = True,
 ) -> dict:
     """
-    Compute associations between columns in the dataset. Three association
-    types are supported and can be toggled independently:
+    Compute pairwise associations between columns. Three types, all on by default:
 
-    numeric=True: Pearson and Spearman correlations between continuous and
-    discrete columns. Returns both matrices and strong pairs above threshold.
+    numeric: Pearson + Spearman between continuous/discrete columns.
+    categorical: Cramér's V between categorical/binary columns (0–1).
+    mixed: Eta-squared (η²) between categorical and numeric columns (0–1,
+    measures variance explained).
 
-    categorical=True: Cramér's V association between categorical and binary
-    columns. Ranges from 0 (no association) to 1 (perfect association).
-    Strong pairs flagged at V >= 0.7.
-
-    mixed=True: Eta-squared (η²) between categorical and numeric columns.
-    Measures how much variance in the numeric column is explained by the
-    categorical grouping. Ranges 0-1. Strong pairs flagged at η² >= 0.14
-    (conventional medium effect size).
-
-    numeric_threshold: minimum Spearman |ρ| to include in numeric strong_pairs (default 0.5).
-    categorical_threshold: minimum Cramér's V to include in categorical strong_pairs (default 0.3).
-    mixed_threshold: minimum η² to include in mixed strong_pairs (default 0.1).
-    top_n: number of top pairs to return per type (default 3).
-    plots: set to True to generate heatmaps saved to {stem}_correlations/.
-    Defaults to False — omit when you only need the numbers.
+    numeric_threshold: min |ρ| for strong_pairs (default 0.5).
+    categorical_threshold: min V for strong_pairs (default 0.3).
+    mixed_threshold: min η² for strong_pairs (default 0.1).
+    top_n: max pairs returned per type (default 3).
+    plots: True generates heatmaps + scatter/bar/boxplots in {stem}_correlations/.
     """
     df = load_file(file_path, table)
     stem = Path(file_path.strip()).stem
@@ -311,16 +299,22 @@ def get_correlations(
     if categorical:
         if len(cat_cols) >= 2:
             cramers = compute_cramers_v(df, cat_cols)
-            pairs = strong_categorical_pairs(cramers, cat_cols, categorical_threshold, top_n)
+            pairs = strong_categorical_pairs(
+                cramers, cat_cols, categorical_threshold, top_n
+            )
             result["categorical"] = {
                 "columns": cat_cols,
                 "cramers_v": cramers,
                 "strong_pairs": pairs,
             }
             if plots:
-                result["categorical"]["heatmap"] = plot_categorical_heatmap(cramers, cat_cols, out)
+                result["categorical"]["heatmap"] = plot_categorical_heatmap(
+                    cramers, cat_cols, out
+                )
                 result["categorical"]["grouped_bars"] = [
-                    plot_grouped_bar(df, p["column_a"], p["column_b"], p["cramers_v"], out)
+                    plot_grouped_bar(
+                        df, p["column_a"], p["column_b"], p["cramers_v"], out
+                    )
                     for p in pairs
                 ]
         else:
@@ -337,13 +331,19 @@ def get_correlations(
                 "strong_pairs": pairs,
             }
             if plots:
-                result["mixed"]["heatmap"] = plot_mixed_heatmap(eta, num_cols, cat_cols, out)
+                result["mixed"]["heatmap"] = plot_mixed_heatmap(
+                    eta, num_cols, cat_cols, out
+                )
                 result["mixed"]["boxplots"] = [
-                    plot_boxplot(df, p["numeric"], p["categorical"], p["eta_squared"], out)
+                    plot_boxplot(
+                        df, p["numeric"], p["categorical"], p["eta_squared"], out
+                    )
                     for p in pairs
                 ]
         else:
-            result["mixed"] = {"error": "Need at least 1 numeric and 1 categorical column."}
+            result["mixed"] = {
+                "error": "Need at least 1 numeric and 1 categorical column."
+            }
 
     return result
 
@@ -359,31 +359,36 @@ def generate_report(
     mixed: bool = True,
 ) -> dict:
     """
-    Generate a complete EDA markdown report for the entire dataset. This is the
-    main tool to call for a thorough, end-to-end analysis. The report includes:
+    Generate a full EDA markdown report — dataset overview, data quality flags,
+    per-column stats with diagnostic plots, and association analysis (Pearson,
+    Cramér's V, eta-squared). Saves to {filename}_eda_report.md.
 
-    - Dataset overview: row count, column count, memory usage, total missing values
-    - Data quality flags: columns with >20% missing values, imbalanced binary
-      columns, high cardinality columns, columns with infinite values, columns
-      with >10% outliers by IQR method
-    - Per-column variable summaries: statistics table, diagnostic plot image,
-      and a 2-3 sentence plain english interpretation of the distribution shape,
-      outliers, and data quality for each column
-    - Association analysis: numeric correlations (Pearson + Spearman), categorical
-      associations (Cramér's V), and mixed associations (eta-squared). Each section
-      can be toggled off with numeric=False, categorical=False, or mixed=False.
+    Always ask the user for output_dir before calling. Default saves next to
+    the source file in output/, which may not be what they want.
 
-    Saves the report as {filename}_eda_report.md in output_dir. Returns the path.
+    Returns path, flags, column_classifications, and shape. After generating,
+    present the path and summarize the flags to the user — ask which columns
+    or issues they want to investigate next. Do not automatically call further
+    tools without the user's direction.
 
-    For quick inspection of a single column use get_column_summary or
-    get_diagnostic_plot instead of running the full report.
+    Toggle association sections with numeric/categorical/mixed bools.
     """
     df = load_file(file_path, table)
-    path = generate_markdown_report(
-        df, file_path, _resolve_output_dir(file_path, output_dir),
-        numeric=numeric, categorical=categorical, mixed=mixed,
+    path, flags, classifications = generate_markdown_report(
+        df,
+        file_path,
+        _resolve_output_dir(file_path, output_dir),
+        numeric=numeric,
+        categorical=categorical,
+        mixed=mixed,
     )
-    return {"path": path}
+    return {
+        "path": path,
+        "rows": df.shape[0],
+        "columns": df.shape[1],
+        "flags": flags,
+        "column_classifications": classifications,
+    }
 
 
 @mcp.tool()
@@ -403,7 +408,8 @@ def compare_distributions(
     query_dataset:
 
       # Two file paths
-      compare_distributions("sales_2023.parquet", "sales_2024.parquet")
+
+            compare_distributions("sales_2023.parquet", "sales_2024.parquet")
 
       # Two slices from the same file — one condition per source
       compare_distributions(
@@ -452,7 +458,8 @@ def compare_distributions(
         diff = {
             f"classification_{label_a}": s_a.get("classification"),
             f"classification_{label_b}": s_b.get("classification"),
-            "classification_changed": s_a.get("classification") != s_b.get("classification"),
+            "classification_changed": s_a.get("classification")
+            != s_b.get("classification"),
         }
         for key in _NUMERIC_DIFF_KEYS:
             v_a = s_a.get(key)
@@ -464,7 +471,10 @@ def compare_distributions(
                     diff[f"{key}_delta"] = round(float(v_b) - float(v_a), 4)
                 except (TypeError, ValueError):
                     pass
-        if s_a.get("classification") == "categorical" or s_b.get("classification") == "categorical":
+        if (
+            s_a.get("classification") == "categorical"
+            or s_b.get("classification") == "categorical"
+        ):
             diff[f"mode_{label_a}"] = s_a.get("mode")
             diff[f"mode_{label_b}"] = s_b.get("mode")
             diff["mode_changed"] = s_a.get("mode") != s_b.get("mode")
@@ -529,12 +539,16 @@ def get_column_summary_by_group(
     df = load_file(file_path, table)
 
     if column not in df.columns:
-        return {"error": f"Column '{column}' not found. Available columns: {df.columns}"}
+        return {
+            "error": f"Column '{column}' not found. Available columns: {df.columns}"
+        }
 
     group_cols = [group_by] if isinstance(group_by, str) else group_by
     missing = [c for c in group_cols if c not in df.columns]
     if missing:
-        return {"error": f"Group column(s) not found: {missing}. Available columns: {df.columns}"}
+        return {
+            "error": f"Group column(s) not found: {missing}. Available columns: {df.columns}"
+        }
 
     results = {}
     group_counts = {}
@@ -545,7 +559,11 @@ def get_column_summary_by_group(
         group_counts[key] = len(group_df)
         try:
             summary = get_summary(group_df[column])
-            results[key] = summary if full_summary else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
+            results[key] = (
+                summary
+                if full_summary
+                else {k: v for k, v in summary.items() if k in _COMPACT_KEYS}
+            )
         except Exception as e:
             results[key] = {"error": str(e)}
 

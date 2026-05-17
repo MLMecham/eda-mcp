@@ -245,7 +245,7 @@ def generate_markdown_report(
             corr=corr,
         ))
 
-    return out_path
+    return out_path, flags, {col: s.get("classification") for col, s in summaries.items()}
 
 
 def _build_correlation_section(
